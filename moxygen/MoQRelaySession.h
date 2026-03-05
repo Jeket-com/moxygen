@@ -46,6 +46,26 @@ class MoQRelaySession : public MoQSession {
   folly::coro::Task<Publisher::SubscribeAnnouncesResult> subscribeAnnounces(
       SubscribeAnnounces subAnn) override;
 
+  // Publisher-initiated PUBLISH (MOQ spec v14 Section 8.4)
+  // Allows publisher to announce individual tracks to relay before subscribers arrive
+  class PublishTrackHandle {
+   public:
+    PublishTrackHandle() = default;
+    explicit PublishTrackHandle(PublishOk ok) : publishOk_(std::move(ok)) {}
+    virtual ~PublishTrackHandle() = default;
+
+    const PublishOk& publishOk() const {
+      return *publishOk_;
+    }
+
+   protected:
+    folly::Optional<PublishOk> publishOk_;
+  };
+
+  using PublishTrackResult =
+      folly::Expected<std::shared_ptr<PublishTrackHandle>, PublishError>;
+  folly::coro::Task<PublishTrackResult> publishTrack(PublishRequest pub);
+
  private:
   // Forward declarations for inner classes
   class SubscriberAnnounceCallback;

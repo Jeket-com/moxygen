@@ -755,11 +755,22 @@ class Extensions {
  public:
   Extensions() = default;
 
-  // Constructor that takes both mutable and immutable extensions
+  // Constructor that takes both mutable and immutable extensions (copy)
   Extensions(
       const std::vector<Extension>& mutableExts,
       const std::vector<Extension>& immutableExts)
       : mutableExtensions(mutableExts), immutableExtensions(immutableExts) {}
+
+  // Constructor that takes both mutable and immutable extensions (move)
+  Extensions(
+      std::vector<Extension>&& mutableExts,
+      std::vector<Extension>&& immutableExts)
+      : mutableExtensions(std::move(mutableExts)),
+        immutableExtensions(std::move(immutableExts)) {}
+
+  // Constructor that takes only mutable extensions (move)
+  explicit Extensions(std::vector<Extension>&& mutableExts)
+      : mutableExtensions(std::move(mutableExts)), immutableExtensions() {}
 
   // Getter for mutableExtensions (returns reference)
   std::vector<Extension>& getMutableExtensions() {

@@ -234,7 +234,7 @@ void MoQServer::Handler::onHeadersComplete(
   HTTPMessage resp;
   resp.setHTTPVersion(1, 1);
 
-  if (req->getPathAsStringPiece() != server_.getEndpoint()) {
+  if (!req->getPathAsStringPiece().startsWith(server_.getEndpoint())) {
     XLOG(DBG0) << req->getPathAsStringPiece();
     req->dumpMessage(0);
     resp.setStatusCode(404);

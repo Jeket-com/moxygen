@@ -2484,7 +2484,13 @@ folly::coro::Task<void> MoQSession::controlReadLoop(
     fin = streamData->fin;
     XLOG_IF(DBG3, fin) << "End of stream id=" << streamId << " sess=" << this;
   }
-  // TODO: close session on control exit
+  // Close session when the control stream ends unexpectedly.
+  // This ensures the peer is notified so it can reconnect.
+  if (!closed_ && !token.isCancellationRequested()) {
+    XLOG(ERR) << "Control stream ended unexpectedly, closing session"
+              << " fin=" << fin << " id=" << streamId << " sess=" << this;
+    close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
+  }
 }
 
 std::shared_ptr<MoQSession::SubscribeTrackReceiveState>
@@ -3122,13 +3128,14 @@ folly::coro::Task<void> MoQSession::handleSubscribe(
   setRequestSession();
   auto requestID = sub.requestID;
   auto fullTrackName = sub.fullTrackName;
-  auto& params = sub.params;
 
-  // TODO: Formalize after parameter refactor
-  // We should only keep e2e params here and remove everything else
-  //// Remove DELIVERY_TIMEOUT param from params before passing to
-  //// publishHandler_
-  params.eraseAllParamsOfType(TrackRequestParamKey::DELIVERY_TIMEOUT);
+  // Remove DELIVERY_TIMEOUT param from params before passing to
+  // publishHandler_.  Operate directly on sub.params rather than through a
+  // reference — the combination of modifying via an alias and then
+  // std::move(sub) into the callee coroutine was observed to corrupt the
+  // vector's internal state on certain compilers (GCC 11 / aarch64),
+  // resulting in a SIGSEGV when the callee's coroutine frame was destroyed.
+  sub.params.eraseAllParamsOfType(TrackRequestParamKey::DELIVERY_TIMEOUT);
 
   auto subscribeResult = co_await co_awaitTry(co_withCancellation(
       cancellationSource_.getToken(),

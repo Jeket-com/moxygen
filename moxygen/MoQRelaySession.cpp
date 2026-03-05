@@ -337,6 +337,43 @@ folly::coro::Task<Subscriber::AnnounceResult> MoQRelaySession::announce(
   }
 }
 
+// Publisher-initiated PUBLISH implementation (MOQ spec v14 Section 8.4)
+folly::coro::Task<MoQRelaySession::PublishTrackResult>
+MoQRelaySession::publishTrack(PublishRequest pub) {
+  XLOG(DBG1) << __func__ << " track=" << pub.fullTrackName << " sess=" << this;
+
+  if (logger_) {
+    logger_->logPublish(pub);
+  }
+
+  const auto& fullTrackName = pub.fullTrackName;
+  pub.requestID = getNextRequestID();
+
+  auto res = moqFrameWriter_.writePublish(controlWriteBuf_, pub);
+  if (!res) {
+    XLOG(ERR) << "writePublish failed sess=" << this;
+    co_return folly::makeUnexpected(PublishError(
+        {pub.requestID,
+         PublishErrorCode::INTERNAL_ERROR,
+         "local write failed"}));
+  }
+  controlWriteEvent_.signal();
+
+  auto contract = folly::coro::makePromiseContract<
+      folly::Expected<PublishOk, PublishError>>();
+  pendingRequests_.emplace(
+      pub.requestID,
+      PendingRequestState::makePublish(std::move(contract.first)));
+
+  auto publishResult = co_await std::move(contract.second);
+  if (publishResult.hasError()) {
+    co_return folly::makeUnexpected(publishResult.error());
+  } else {
+    co_return std::make_shared<PublishTrackHandle>(
+        std::move(publishResult.value()));
+  }
+}
+
 void MoQRelaySession::onRequestOk(RequestOk requestOk, FrameType frameType) {
   XLOG(DBG1) << __func__ << " id=" << requestOk.requestID << " sess=" << this;
 
