@@ -234,7 +234,8 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
             cursor, remainingLength, subgroupOptions_);
 
         if (res.hasError()) {
-          XLOG(DBG6) << __func__ << " " << uint32_t(res.error());
+          XLOG(ERR) << "[JEKET-DIAG] parseSubgroupHeader failed err="
+                    << uint32_t(res.error()) << " streamId=" << streamId_;
           connError_ = res.error();
           break;
         }
@@ -253,7 +254,11 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
             ingress_.trimStart(ingress_.chainLength() - cursor.totalLength());
             return ParseResult::BLOCKED;
           } else if (result == ParseResult::ERROR_TERMINATE) {
-            XLOG(DBG) << "subgroup callback returned ERROR_TERIMNATE";
+            XLOG(ERR) << "[JEKET-DIAG] onSubgroup callback ERROR_TERMINATE"
+                      << " trackAlias=" << res->value.trackAlias.value
+                      << " group=" << curObjectHeader_.group
+                      << " subgroup=" << curObjectHeader_.subgroup
+                      << " streamId=" << streamId_;
             return result;
           }
         }
@@ -274,7 +279,10 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
               cursor, remainingLength, curObjectHeader_, subgroupOptions_);
         }
         if (res.hasError()) {
-          XLOG(DBG4) << __func__ << " " << uint32_t(res.error());
+          XLOG(ERR) << "[JEKET-DIAG] parseObjectHeader failed err="
+                    << uint32_t(res.error())
+                    << " streamType=" << uint32_t(streamType_)
+                    << " streamId=" << streamId_;
           connError_ = res.error();
           break;
         }
@@ -312,7 +320,11 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
               connError_ = ErrorCode::INTERNAL_ERROR;
               break;
             } else if (result == ParseResult::ERROR_TERMINATE) {
-              XLOG(DBG) << "onObjectBegin callback returned ERROR_TERMINATE";
+              XLOG(ERR) << "[JEKET-DIAG] onObjectBegin callback ERROR_TERMINATE"
+                        << " group=" << curObjectHeader_.group
+                        << " subgroup=" << curObjectHeader_.subgroup
+                        << " id=" << curObjectHeader_.id
+                        << " streamId=" << streamId_;
               return result;
             }
           }
@@ -408,6 +420,12 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
   onIngressEnd(remainingLength, endOfStream, callback_);
 
   if (connError_) {
+    XLOG(ERR) << "[JEKET-DIAG] MoQObjectStreamCodec ERROR_TERMINATE"
+              << " connError=" << uint32_t(*connError_)
+              << " parseState=" << uint32_t(parseState_)
+              << " streamType=" << uint32_t(streamType_)
+              << " streamId=" << streamId_
+              << " remaining=" << remainingLength;
     return ParseResult::ERROR_TERMINATE;
   }
   return ParseResult::CONTINUE;

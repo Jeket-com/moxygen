@@ -43,6 +43,13 @@ class MoQCache {
     cache_.clear();
   }
 
+  // JEKET fork: clear cached state for a single track. Used when a publisher
+  // re-announces (e.g. moq-egress restart) so the new session's objects don't
+  // collide with stale CacheEntry records at the same group/object coordinate.
+  void clearTrack(const FullTrackName& ftn) {
+    cache_.erase(ftn);
+  }
+
   // Entry for single cached object
   struct CacheEntry {
     CacheEntry(

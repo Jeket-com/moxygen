@@ -19,11 +19,11 @@ folly::Expected<folly::Unit, MoQPublishError> MoQForwarder::forEachSubscriber(
     subscriberIt++;
     fn(sub);
   }
-  // Check if empty after iteration - subscribers may have been removed in loop
-  if (subscribers_.empty()) {
-    return folly::makeUnexpected(
-        MoQPublishError(MoQPublishError::CANCELLED, "No subscribers"));
-  }
+  // JEKET fork: in PUBLISH push mode with MoQCache writeback, an empty
+  // subscriber list is a legitimate state — the publisher is feeding the
+  // cache, not a direct consumer. Returning "No subscribers" as an error
+  // here causes the incoming subgroup stream to be torn down, preventing
+  // the cache from ever receiving data. Always return success.
   return folly::unit;
 }
 
@@ -72,11 +72,10 @@ MoQForwarder::SubgroupForwarder::forEachSubscriberSubgroup(
       }
     }
   });
-  // Check if empty after iteration - subscribers may have been removed in loop
-  if (forwarder_.subscribers_.empty()) {
-    return folly::makeUnexpected(
-        MoQPublishError(MoQPublishError::CANCELLED, "No subscribers"));
-  }
+  // JEKET fork: same rationale as forEachSubscriber — an empty subscriber
+  // list is a legitimate state under PUBLISH push mode with MoQCache
+  // writeback. Do not tear down the publisher's subgroup stream just
+  // because no live viewers are currently attached.
   return folly::unit;
 }
 

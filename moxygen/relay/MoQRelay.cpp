@@ -404,6 +404,16 @@ Subscriber::PublishResult MoQRelay::publish(
   // SUBSCRIBE path (see the subscribe() branch). Without this, PUBLISHed
   // data would bypass the cache and be dropped for any subscriber that
   // arrives after the group they care about was pushed.
+  //
+  // JEKET fork: clear any stale cached objects for this track before wiring
+  // the new writeback. When a publisher restarts (e.g. moq-egress pod
+  // bounce), its new session starts fresh group/object numbering. Without
+  // this, the cache still holds the OLD completed CacheEntry at group=1
+  // obj=0 and MoQCache::cacheObject rejects the new data with "Payload
+  // mismatch; objID=0", tearing down the incoming subgroup stream.
+  if (cache_) {
+    cache_->clearTrack(pub.fullTrackName);
+  }
   auto publishConsumer = getSubscribeWriteback(pub.fullTrackName, forwarder);
 
   return PublishConsumerAndReplyTask{
@@ -928,12 +938,22 @@ void MoQRelay::onEmpty(MoQForwarder* forwarder) {
   // Handle exists - just last subscriber left
   XLOG(INFO) << "Last subscriber removed for " << subscriptionIt->first;
   if (subscription.isPublish) {
-    // if it's publish, don't unsubscribe, just subscribeUpdate forward=false
-    XLOG(DBG1) << "Updating upstream subscription forward=false";
-    auto exec = subscription.upstream->getExecutor();
-    co_withExecutor(
-        exec, doSubscribeUpdate(subscription.handle, /*forward=*/false))
-        .start();
+    // JEKET fork: do NOT send SUBSCRIBE_UPDATE forward=false to the
+    // publisher when the last downstream subscriber leaves. Upstream
+    // moxygen's behavior pauses the publisher, which starves the MoQCache
+    // writeback of data — so a late-joining viewer finds an empty cache and
+    // can't play until the next subscriber-triggered forward=true cycle.
+    //
+    // This is the same rationale as the publish() fork fix: with MoQCache
+    // enabled on the relay, the publisher feeds the cache continuously and
+    // the cache serves late joiners. Pausing the publisher on "0
+    // subscribers" re-creates the chicken-and-egg deadlock we fixed in
+    // Jeket-com/JSS#24.
+    //
+    // Keep the subscription alive; keep forward=true. The publisher keeps
+    // pushing; MoQCache evicts old groups naturally; late subscribers pick
+    // up the most recent cached groups on subscribe.
+    XLOG(DBG1) << "isPublish: keeping publisher forward=true for cache warmth";
   } else {
     subscription.handle->unsubscribe();
     XLOG(DBG4) << "Erasing subscription to " << subscriptionIt->first;
@@ -949,6 +969,15 @@ void MoQRelay::forwardChanged(MoQForwarder* forwarder) {
   auto& subscription = subscriptionIt->second;
   if (!subscription.promise.isFulfilled()) {
     // Ignore: it's the first subscriber, forward update not needed
+    return;
+  }
+  // JEKET fork: for isPublish subscriptions, never propagate a forward=false
+  // flip back to the publisher (see onEmpty comment above — we keep the
+  // MoQCache warm even when 0 live subscribers are present). Upstream-
+  // SUBSCRIBE paths still honor the subscriber count.
+  if (subscription.isPublish) {
+    XLOG(DBG1) << "forwardChanged: isPublish — skipping forward update for "
+               << subscriptionIt->first;
     return;
   }
   XLOG(INFO) << "Updating forward for " << subscriptionIt->first

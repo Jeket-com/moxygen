@@ -2608,7 +2608,9 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
     if (!callback) {
       // This cannot happen in a SUBSCRIBE_DONE flow, because
       // that also would have removed subscribeState.
-      XLOG(DBG2) << "No callback for subgroup (unsubscribed)";
+      XLOG(ERR) << "[JEKET-DIAG] onSubgroup: no callback (unsubscribed)"
+                << " alias=" << alias.value << " group=" << group
+                << " subgroup=" << subgroup;
       return MoQCodec::ParseResult::ERROR_TERMINATE;
     }
 
@@ -2619,6 +2621,11 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
     if (res.hasValue()) {
       subgroupCallback_ = *res;
     } else {
+      XLOG(ERR) << "[JEKET-DIAG] onSubgroup: beginSubgroup returned error"
+                << " alias=" << alias.value << " group=" << group
+                << " subgroup=" << subgroup
+                << " err=" << uint32_t(res.error().code)
+                << " msg=" << res.error().msg;
       return MoQCodec::ParseResult::ERROR_TERMINATE;
     }
     if (logger_) {
