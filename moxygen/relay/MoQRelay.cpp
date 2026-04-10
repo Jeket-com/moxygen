@@ -388,12 +388,6 @@ Subscriber::PublishResult MoQRelay::publish(
   (void)nSubscribers; // unused — see note below
   forwarder->setCallback(shared_from_this());
 
-  // Wrap forwarder in filter to intercept subscribeDone
-  auto filterImpl = std::make_shared<TerminationFilter>(
-      shared_from_this(), pub.fullTrackName, forwarder);
-  std::shared_ptr<TrackConsumer> filter =
-      std::static_pointer_cast<TrackConsumer>(filterImpl);
-
   // Jeket fork: publisher is always allowed to push. The upstream relay
   // gates PUBLISH forwarding on the presence of a downstream SubscribeAnnounces
   // subscriber (nSubscribers > 0), which creates a chicken-and-egg deadlock
@@ -404,8 +398,16 @@ Subscriber::PublishResult MoQRelay::publish(
   // late-joining subscribers. SUBSCRIBE_UPDATE from arriving/leaving
   // subscribers can still tune per-subgroup delivery; this only changes the
   // initial PublishOk gate.
+  //
+  // Use getSubscribeWriteback() to wire the publisher's push path through
+  // MoQCache (if enabled) and TerminationFilter, mirroring the upstream-
+  // SUBSCRIBE path (see the subscribe() branch). Without this, PUBLISHed
+  // data would bypass the cache and be dropped for any subscriber that
+  // arrives after the group they care about was pushed.
+  auto publishConsumer = getSubscribeWriteback(pub.fullTrackName, forwarder);
+
   return PublishConsumerAndReplyTask{
-      filter, // Return filter, not forwarder directly
+      publishConsumer,
       folly::coro::makeTask<folly::Expected<PublishOk, PublishError>>(PublishOk{
           pub.requestID,
           /*forward=*/true,
