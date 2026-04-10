@@ -385,6 +385,7 @@ Subscriber::PublishResult MoQRelay::publish(
           .start();
     }
   }
+  (void)nSubscribers; // unused — see note below
   forwarder->setCallback(shared_from_this());
 
   // Wrap forwarder in filter to intercept subscribeDone
@@ -393,11 +394,21 @@ Subscriber::PublishResult MoQRelay::publish(
   std::shared_ptr<TrackConsumer> filter =
       std::static_pointer_cast<TrackConsumer>(filterImpl);
 
+  // Jeket fork: publisher is always allowed to push. The upstream relay
+  // gates PUBLISH forwarding on the presence of a downstream SubscribeAnnounces
+  // subscriber (nSubscribers > 0), which creates a chicken-and-egg deadlock
+  // for live egress: Cloudflare only subscribes when a viewer arrives, the
+  // viewer can't play without cached data, and the relay can't cache without
+  // the publisher pushing. We break the deadlock by accepting push data
+  // unconditionally — the forwarder + MoQCache buffer recent groups for
+  // late-joining subscribers. SUBSCRIBE_UPDATE from arriving/leaving
+  // subscribers can still tune per-subgroup delivery; this only changes the
+  // initial PublishOk gate.
   return PublishConsumerAndReplyTask{
       filter, // Return filter, not forwarder directly
       folly::coro::makeTask<folly::Expected<PublishOk, PublishError>>(PublishOk{
           pub.requestID,
-          /*forward=*/(nSubscribers > 0),
+          /*forward=*/true,
           kDefaultPriority,
           pub.groupOrder,
           LocationType::AbsoluteRange,
