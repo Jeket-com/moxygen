@@ -43,7 +43,14 @@ MoQServer::MoQServer(
     folly::Optional<quic::TransportSettings> transportSettings)
     : MoQServerBase(std::move(endpoint)), fizzContext_(std::move(fizzContext)) {
   params_.serverThreads = 1;
-  params_.txnTimeout = std::chrono::seconds(60);
+  // JEKET fork: default 60s transaction timeout kills long-lived WebTransport
+  // sessions. The CONNECT stream (stream 0) sits idle after the handshake
+  // completes — all MoQ data flows on *other* streams — so proxygen fires an
+  // "ingress timeout, streamID=0, timeout=60000ms" exception exactly 60s into
+  // every session and tears down the whole WebTransport connection. Raise
+  // the timeout to 24 hours so browsers and publishers can stay connected
+  // for the lifetime of a live event. See Jeket-com/JSS#32 / #59.
+  params_.txnTimeout = std::chrono::hours(24);
   if (transportSettings) {
     params_.transportSettings = *transportSettings;
   } else {
