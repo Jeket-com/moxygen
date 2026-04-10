@@ -799,10 +799,13 @@ folly::Expected<ObjectPublishStatus, MoQPublishError>
 MoQForwarder::SubgroupForwarder::objectPayload(
     Payload payload,
     bool finSubgroup) {
-  auto parent = weakForwarder_.lock(); // JEKET fork: see #46
-  if (!parent) {
-    return ObjectPublishStatus::DONE;
-  }
+  // JEKET fork: see #46 — we must NOT early-return DONE here regardless
+  // of object completion state, because MoQSession::onObjectPayload fires
+  // a FATAL XCHECK if `objectComplete != (res == DONE)`. Instead, run the
+  // same length-accounting the live path runs so the returned status
+  // accurately reflects whether this payload finished the object, just
+  // skip the forwarder broadcast when the parent is gone.
+  auto parent = weakForwarder_.lock();
   if (!currentObjectLength_) {
     return folly::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "Haven't started publishing object"));
@@ -813,6 +816,15 @@ MoQForwarder::SubgroupForwarder::objectPayload(
         MoQPublishError(MoQPublishError::API_ERROR, "Payload exceeded length"));
   }
   *currentObjectLength_ -= payloadLength;
+  if (!parent) {
+    // Parent MoQForwarder is gone. Short-circuit the subscriber broadcast
+    // but preserve length-accounting + return the protocol-correct status.
+    if (*currentObjectLength_ == 0) {
+      currentObjectLength_.reset();
+      return ObjectPublishStatus::DONE;
+    }
+    return ObjectPublishStatus::IN_PROGRESS;
+  }
   auto res = forEachSubscriberSubgroup(
       [&](const std::shared_ptr<Subscriber>& sub,
           const std::shared_ptr<SubgroupConsumer>& subgroupConsumer) {
