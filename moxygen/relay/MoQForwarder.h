@@ -15,7 +15,15 @@
 
 namespace moxygen {
 
-class MoQForwarder : public TrackConsumer {
+// JEKET fork: enable_shared_from_this so SubgroupForwarder can keep a
+// weak_ptr to its parent and lock it into a temporary shared_ptr for the
+// duration of any method call. This prevents a publisher object callback
+// from destroying MoQForwarder synchronously (via
+// removeSubscriberOnError → onEmpty → subscriptions_.erase) while we're
+// still inside SubgroupForwarder::object(). See Jeket-com/JSS#46.
+class MoQForwarder
+    : public TrackConsumer,
+      public std::enable_shared_from_this<MoQForwarder> {
  public:
   explicit MoQForwarder(
       FullTrackName ftn,
@@ -189,6 +197,16 @@ class MoQForwarder : public TrackConsumer {
     MoQForwarder& forwarder_;
     SubgroupIdentifier identifier_;
     Priority priority_;
+    // JEKET fork: the MoQCache holds a shared_ptr to this SubgroupForwarder
+    // via SubgroupWriteback::consumer_. When the MoQRelay erases a
+    // subscription (publisher terminated, or last subscriber left),
+    // MoQForwarder may be destroyed while this SubgroupForwarder is still
+    // alive — or mid-method via the synchronous
+    // removeSubscriberOnError → onEmpty → subscriptions_.erase chain. Hold
+    // a weak_ptr so each public method can lock() the parent for the
+    // duration of the call, keeping it alive and short-circuiting when
+    // dead. See Jeket-com/JSS#46.
+    std::weak_ptr<MoQForwarder> weakForwarder_;
 
     template <typename Fn>
     folly::Expected<folly::Unit, MoQPublishError> forEachSubscriberSubgroup(

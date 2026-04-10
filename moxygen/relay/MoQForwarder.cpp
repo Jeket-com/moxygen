@@ -567,7 +567,8 @@ MoQForwarder::SubgroupForwarder::SubgroupForwarder(
     Priority priority)
     : forwarder_(forwarder),
       identifier_{group, subgroup},
-      priority_(priority) {}
+      priority_(priority),
+      weakForwarder_(forwarder.weak_from_this()) {}
 
 void MoQForwarder::SubgroupForwarder::closeSubgroupForSubscriber(
     const std::shared_ptr<Subscriber>& sub,
@@ -603,6 +604,15 @@ MoQForwarder::SubgroupForwarder::object(
     Payload payload,
     Extensions extensions,
     bool finSubgroup) {
+  // JEKET fork: hold the parent alive for the duration of this call so
+  // that a synchronous `removeSubscriberOnError → onEmpty → erase` chain
+  // can't destroy `forwarder_` under us. If the parent is already gone,
+  // silently absorb the write so the publisher's stream can drain.
+  // See Jeket-com/JSS#46.
+  auto parent = weakForwarder_.lock();
+  if (!parent) {
+    return folly::unit;
+  }
   if (currentObjectLength_) {
     return folly::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "Still publishing previous object"));
@@ -632,6 +642,10 @@ folly::Expected<folly::Unit, MoQPublishError>
 MoQForwarder::SubgroupForwarder::objectNotExists(
     uint64_t objectID,
     bool finSubgroup) {
+  auto parent = weakForwarder_.lock(); // JEKET fork: see #46
+  if (!parent) {
+    return folly::unit;
+  }
   if (currentObjectLength_) {
     return folly::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "Still publishing previous object"));
@@ -662,6 +676,10 @@ MoQForwarder::SubgroupForwarder::beginObject(
     uint64_t length,
     Payload initialPayload,
     Extensions extensions) {
+  auto parent = weakForwarder_.lock(); // JEKET fork: see #46
+  if (!parent) {
+    return folly::unit;
+  }
   // TODO: use a shared class for object publish state validation
   forwarder_.updateLargest(identifier_.group, objectID);
   if (currentObjectLength_) {
@@ -688,6 +706,10 @@ MoQForwarder::SubgroupForwarder::beginObject(
 
 folly::Expected<folly::Unit, MoQPublishError>
 MoQForwarder::SubgroupForwarder::endOfGroup(uint64_t endOfGroupObjectID) {
+  auto parent = weakForwarder_.lock(); // JEKET fork: see #46
+  if (!parent) {
+    return folly::unit;
+  }
   if (currentObjectLength_) {
     return folly::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "Still publishing previous object"));
@@ -710,6 +732,10 @@ MoQForwarder::SubgroupForwarder::endOfGroup(uint64_t endOfGroupObjectID) {
 folly::Expected<folly::Unit, MoQPublishError>
 MoQForwarder::SubgroupForwarder::endOfTrackAndGroup(
     uint64_t endOfTrackObjectID) {
+  auto parent = weakForwarder_.lock(); // JEKET fork: see #46
+  if (!parent) {
+    return folly::unit;
+  }
   if (currentObjectLength_) {
     return folly::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "Still publishing previous object"));
@@ -732,6 +758,10 @@ MoQForwarder::SubgroupForwarder::endOfTrackAndGroup(
 
 folly::Expected<folly::Unit, MoQPublishError>
 MoQForwarder::SubgroupForwarder::endOfSubgroup() {
+  auto parent = weakForwarder_.lock(); // JEKET fork: see #46
+  if (!parent) {
+    return folly::unit;
+  }
   if (currentObjectLength_) {
     return folly::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "Still publishing previous object"));
@@ -752,6 +782,10 @@ MoQForwarder::SubgroupForwarder::endOfSubgroup() {
 }
 
 void MoQForwarder::SubgroupForwarder::reset(ResetStreamErrorCode error) {
+  auto parent = weakForwarder_.lock(); // JEKET fork: see #46
+  if (!parent) {
+    return;
+  }
   forEachSubscriberSubgroup(
       [&](const std::shared_ptr<Subscriber>& sub,
           const std::shared_ptr<SubgroupConsumer>& subgroupConsumer) {
@@ -765,6 +799,10 @@ folly::Expected<ObjectPublishStatus, MoQPublishError>
 MoQForwarder::SubgroupForwarder::objectPayload(
     Payload payload,
     bool finSubgroup) {
+  auto parent = weakForwarder_.lock(); // JEKET fork: see #46
+  if (!parent) {
+    return ObjectPublishStatus::DONE;
+  }
   if (!currentObjectLength_) {
     return folly::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "Haven't started publishing object"));
