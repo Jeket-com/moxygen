@@ -343,8 +343,18 @@ Subscriber::PublishResult MoQRelay::publish(
     XLOG(DBG4) << "Erasing subscription to " << it->first;
     subscriptions_.erase(it);
   }
+  // JEKET fork: defense in depth for publisher reconnect. The primary
+  // cleanup path is onPublishDone()/onEmpty() which should erase the
+  // stale publishes entry before we get here. But if anything leaks past
+  // those paths, the upstream XCHECK(Duplicate publish) crashes the
+  // whole relay process. Replace is safer and idempotent — overwrite
+  // the stale session pointer with the new one. See Jeket-com/JSS#30.
   auto res = nodePtr->publishes.emplace(pub.fullTrackName.trackName, session);
-  XCHECK(res.second) << "Duplicate publish";
+  if (!res.second) {
+    XLOG(WARNING) << "Duplicate publish for " << pub.fullTrackName
+                  << " — replacing stale entry (reconnect-race cleanup)";
+    res.first->second = session;
+  }
 
   // If this is the first content added to this node, notify parent
   if (wasEmpty && nodePtr->hasLocalSessions() && nodePtr->parent_) {
@@ -931,6 +941,26 @@ void MoQRelay::onEmpty(MoQForwarder* forwarder) {
   if (!subscription.handle) {
     // Handle is null - publisher terminated via FilterConsumer
     XLOG(INFO) << "Publisher terminated for " << subscriptionIt->first;
+    // JEKET fork: the publisher's entry in nodePtr->publishes must be
+    // erased alongside subscriptions_, otherwise a reconnect triggers
+    // `XCHECK(Duplicate publish)` in MoQRelay::publish() when the new
+    // session tries to emplace into the still-populated publishes map.
+    // onPublishDone() takes care of this on a clean close, but a
+    // publisher that terminates mid-stream reaches us here instead.
+    // See Jeket-com/JSS#30.
+    const auto& ftn = subscriptionIt->first;
+    if (subscription.isPublish) {
+      auto nodePtr = findNamespaceNode(ftn.trackNamespace);
+      if (nodePtr) {
+        bool hadLocalContent = nodePtr->hasLocalSessions();
+        nodePtr->publishes.erase(ftn.trackName);
+        if (hadLocalContent && !nodePtr->shouldKeep() && nodePtr->parent_ &&
+            !ftn.trackNamespace.trackNamespace.empty()) {
+          nodePtr->parent_->tryPruneChild(
+              ftn.trackNamespace.trackNamespace.back());
+        }
+      }
+    }
     subscriptions_.erase(subscriptionIt);
     return;
   }
