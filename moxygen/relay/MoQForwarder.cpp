@@ -13,10 +13,27 @@ namespace moxygen {
 template <typename Fn>
 folly::Expected<folly::Unit, MoQPublishError> MoQForwarder::forEachSubscriber(
     Fn&& fn) {
-  for (auto subscriberIt = subscribers_.begin();
-       subscriberIt != subscribers_.end();) {
-    const auto& sub = subscriberIt->second;
-    subscriberIt++;
+  // JEKET fork: take a std::shared_ptr COPY (not a reference to the map
+  // value) so fn can safely call removeSubscriber/removeSubscriberOnError,
+  // which erases this subscriber's entry from subscribers_ mid-iteration.
+  // Without the copy, `const auto& sub = subscriberIt->second` became a
+  // dangling reference the moment the erase ran, and any subsequent use
+  // of `sub` in fn (e.g. closeSubgroupForSubscriber after an onError
+  // lambda fired synchronously) dereferenced freed memory.
+  // Observed SIGSEGV at MoQForwarder::SubgroupForwarder::object after
+  // "Removing subscriber after error in err=Publish after subscribeDone".
+  // See Jeket-com/JSS#57.
+  //
+  // We also snapshot the list of iterators up-front so mutations by fn
+  // don't invalidate the active iterator. F14FastMap's erase invalidates
+  // iterators; holding a pre-advanced iterator is still risky if fn causes
+  // a rehash (e.g. via a reentrant add). Snapshot is the safest pattern.
+  std::vector<std::shared_ptr<Subscriber>> subs;
+  subs.reserve(subscribers_.size());
+  for (auto& kv : subscribers_) {
+    subs.push_back(kv.second);
+  }
+  for (const auto& sub : subs) {
     fn(sub);
   }
   // JEKET fork: in PUBLISH push mode with MoQCache writeback, an empty

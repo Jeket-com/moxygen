@@ -375,10 +375,36 @@ Subscriber::PublishResult MoQRelay::publish(
     forwarder->setDeliveryTimeout(*deliveryTimeout);
   }
 
+  // JEKET fork: on duplicate, std::unordered_map::emplace with
+  // piecewise_construct does NOT replace the existing value — it returns
+  // the iterator to the EXISTING entry and res.second=false. If we only
+  // rewrote rsub.handle/requestID/isPublish in that case (the old behavior
+  // of this method), rsub.forwarder and rsub.upstream would still point
+  // at the DEAD previous publisher session's state. Subsequent browser
+  // subscribes find the corrupted entry → tries to wire into the old
+  // forwarder (which has no data flow) → falls through to the upstream
+  // path → routes the subscribe to the new publisher as if it were a
+  // pull subscriber → publisher rejects with "PUBLISH-mode: rejected".
+  //
+  // Fix: if an entry already exists for this FTN, erase it first so the
+  // emplace below creates a clean entry with the NEW forwarder + NEW
+  // session. The primary cleanup path in onEmpty() should usually remove
+  // it before we reach this branch, but on specific reconnect races the
+  // old entry can linger. See Jeket-com/JSS#55.
+  {
+    auto existingIt = subscriptions_.find(pub.fullTrackName);
+    if (existingIt != subscriptions_.end()) {
+      XLOG(WARNING) << "JSS#55: subscriptions_ duplicate for "
+                    << pub.fullTrackName
+                    << " on publisher reconnect — erasing stale entry";
+      subscriptions_.erase(existingIt);
+    }
+  }
   auto subRes = subscriptions_.emplace(
       std::piecewise_construct,
       std::forward_as_tuple(pub.fullTrackName),
       std::forward_as_tuple(forwarder, session));
+  XCHECK(subRes.second) << "subscriptions_.emplace still duplicate after erase — bug";
   auto& rsub = subRes.first->second;
   rsub.promise.setValue(folly::unit);
   rsub.requestID = pub.requestID;
