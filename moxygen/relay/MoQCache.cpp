@@ -369,14 +369,25 @@ class MoQCache::SubgroupWriteback : public SubgroupConsumer {
       bool finSubgroup) override {
     // JEKET fork: honor weak_ptr lock, only append to cache entry if group
     // is still alive. Otherwise just forward the payload to consumer_.
+    //
+    // NPE guard: if beginObject was called with a nullptr initialPayload,
+    // the CacheEntry->payload is null. In that case, MOVE-clone this payload
+    // into the entry instead of calling appendChain on a null IOBuf.
+    // See Jeket-com/JSS#51 follow-up.
     auto group = cacheGroup_.lock();
-    if (group) {
+    if (group && payload) {
       auto it = group->objects.find(currentObject_);
       if (it != group->objects.end() && it->second) {
-        it->second->payload->appendChain(payload->clone());
+        if (it->second->payload) {
+          it->second->payload->appendChain(payload->clone());
+        } else {
+          it->second->payload = payload->clone();
+        }
       }
     }
-    currentLength_ -= payload->computeChainDataLength();
+    if (payload) {
+      currentLength_ -= payload->computeChainDataLength();
+    }
     if (currentLength_ == 0 && group) {
       auto it = group->objects.find(currentObject_);
       if (it != group->objects.end() && it->second) {
