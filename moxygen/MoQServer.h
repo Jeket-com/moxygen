@@ -122,7 +122,29 @@ class MoQServer : public MoQServerBase {
     }
     void onUpgrade(proxygen::UpgradeProtocol) noexcept override {}
     void onError(const proxygen::HTTPException& error) noexcept override {
-      XLOG(ERR) << folly::exceptionStr(error);
+      // JEKET fork: swallow the 60s "ingress timeout" fake exception.
+      // WebTransport CONNECT streams have no ingress body by design — all
+      // MoQ data flows on SEPARATE unidirectional streams, not on stream 0.
+      // But proxygen's per-stream ingress idle timer still fires on the
+      // CONNECT stream every ~60s and tears down the WebTransport session.
+      // The params_.txnTimeout = 24h override we set in the server
+      // constructor isn't propagating to the HTTPTransaction idle timer
+      // for reasons we haven't diagnosed (see Jeket-com/JSS#74).
+      //
+      // Filter the error message specifically for "ingress timeout"; any
+      // other HTTPException still tears down the session as normal.
+      // If proxygen force-detaches the transaction after onError returns,
+      // we'll see it in the next restart and know this workaround isn't
+      // sufficient. But for the demo window we need WebTransport sessions
+      // to outlive 60 seconds.
+      const auto msg = folly::exceptionStr(error).toStdString();
+      if (msg.find("ingress timeout") != std::string::npos) {
+        XLOG(WARNING) << "[JEKET] Ignoring proxygen ingress timeout — "
+                      << "WebTransport CONNECT stream is idle by design. "
+                      << "Session stays alive. " << msg;
+        return;  // do NOT tear down the session
+      }
+      XLOG(ERR) << msg;
       onSessionEnd(proxygen::WebTransport::kInternalError);
     }
     void onEgressPaused() noexcept override {}
