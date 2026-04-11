@@ -252,14 +252,33 @@ MoQCache::CacheGroup& MoQCache::CacheTrack::getOrCreateGroup(uint64_t groupID) {
   return *it->second;
 }
 
+// JEKET fork: returns shared_ptr so a SubgroupWriteback can weak_ptr the group
+// and safely detect eviction via MoQCache::clearTrack().
+std::shared_ptr<MoQCache::CacheGroup> MoQCache::CacheTrack::getOrCreateGroupShared(
+    uint64_t groupID) {
+  auto it = groups.find(groupID);
+  if (it == groups.end()) {
+    it = groups.emplace(groupID, std::make_shared<CacheGroup>()).first;
+  }
+  return it->second;
+}
+
+// JEKET fork: SubgroupWriteback now holds weak_ptrs to CacheTrack/CacheGroup
+// so that MoQCache::clearTrack() (publisher reconnect cleanup) can evict a
+// track while the publisher's stream reader still holds a shared_ptr to this
+// SubgroupWriteback. Each method locks the weak_ptrs at entry; if either is
+// null the track has been evicted and we forward the call to the downstream
+// consumer WITHOUT caching (since there's nothing to cache into). That keeps
+// the publisher stream draining cleanly instead of crashing.
+// See Jeket-com/JSS#51.
 class MoQCache::SubgroupWriteback : public SubgroupConsumer {
  public:
   SubgroupWriteback(
       uint64_t group,
       uint64_t subgroup,
       std::shared_ptr<SubgroupConsumer> consumer,
-      CacheTrack& cacheTrack,
-      CacheGroup& cacheGroup)
+      std::shared_ptr<CacheTrack> cacheTrack,
+      std::shared_ptr<CacheGroup> cacheGroup)
       : group_(group),
         subgroup_(subgroup),
         consumer_(std::move(consumer)),
@@ -276,15 +295,20 @@ class MoQCache::SubgroupWriteback : public SubgroupConsumer {
       Payload payload,
       Extensions ext,
       bool finSub) override {
-    auto res = cacheTrack_.updateLargest({group_, objID});
-    if (!res) {
-      return res;
-    }
-    auto cPayload = payload ? payload->clone() : nullptr;
-    auto cacheRes = cacheGroup_.cacheObject(
-        subgroup_, objID, ObjectStatus::NORMAL, ext, std::move(cPayload), true);
-    if (cacheRes.hasError()) {
-      return cacheRes;
+    // JEKET fork: lock weak_ptrs; if track evicted, skip cache and forward.
+    auto track = cacheTrack_.lock();
+    auto group = cacheGroup_.lock();
+    if (track && group) {
+      auto res = track->updateLargest({group_, objID});
+      if (!res) {
+        return res;
+      }
+      auto cPayload = payload ? payload->clone() : nullptr;
+      auto cacheRes = group->cacheObject(
+          subgroup_, objID, ObjectStatus::NORMAL, ext, std::move(cPayload), true);
+      if (cacheRes.hasError()) {
+        return cacheRes;
+      }
     }
     return consumer_->object(objID, std::move(payload), std::move(ext), finSub);
   }
@@ -292,11 +316,15 @@ class MoQCache::SubgroupWriteback : public SubgroupConsumer {
   folly::Expected<folly::Unit, MoQPublishError> objectNotExists(
       uint64_t objID,
       bool finSub) override {
-    auto res = cacheTrack_.updateLargest({group_, objID});
-    if (!res) {
-      return res;
+    auto track = cacheTrack_.lock();
+    auto group = cacheGroup_.lock();
+    if (track && group) {
+      auto res = track->updateLargest({group_, objID});
+      if (!res) {
+        return res;
+      }
+      group->cacheMissingStatus(objID, ObjectStatus::OBJECT_NOT_EXIST);
     }
-    cacheGroup_.cacheMissingStatus(objID, ObjectStatus::OBJECT_NOT_EXIST);
     return consumer_->objectNotExists(objID, finSub);
   }
 
@@ -309,19 +337,23 @@ class MoQCache::SubgroupWriteback : public SubgroupConsumer {
       uint64_t length,
       Payload initialPayload,
       Extensions extensions) override {
-    auto res = cacheTrack_.updateLargest({group_, objectID});
-    if (!res) {
-      return res;
-    }
-    auto cacheRes = cacheGroup_.cacheObject(
-        subgroup_,
-        objectID,
-        ObjectStatus::NORMAL,
-        extensions,
-        initialPayload ? initialPayload->clone() : nullptr,
-        false);
-    if (cacheRes.hasError()) {
-      return cacheRes;
+    auto track = cacheTrack_.lock();
+    auto group = cacheGroup_.lock();
+    if (track && group) {
+      auto res = track->updateLargest({group_, objectID});
+      if (!res) {
+        return res;
+      }
+      auto cacheRes = group->cacheObject(
+          subgroup_,
+          objectID,
+          ObjectStatus::NORMAL,
+          extensions,
+          initialPayload ? initialPayload->clone() : nullptr,
+          false);
+      if (cacheRes.hasError()) {
+        return cacheRes;
+      }
     }
     currentObject_ = objectID;
     currentLength_ = length;
@@ -335,49 +367,67 @@ class MoQCache::SubgroupWriteback : public SubgroupConsumer {
   folly::Expected<ObjectPublishStatus, MoQPublishError> objectPayload(
       Payload payload,
       bool finSubgroup) override {
-    auto& object = cacheGroup_.objects[currentObject_];
-    object->payload->appendChain(payload->clone());
+    // JEKET fork: honor weak_ptr lock, only append to cache entry if group
+    // is still alive. Otherwise just forward the payload to consumer_.
+    auto group = cacheGroup_.lock();
+    if (group) {
+      auto it = group->objects.find(currentObject_);
+      if (it != group->objects.end() && it->second) {
+        it->second->payload->appendChain(payload->clone());
+      }
+    }
     currentLength_ -= payload->computeChainDataLength();
-    if (currentLength_ == 0) {
-      object->complete = true;
+    if (currentLength_ == 0 && group) {
+      auto it = group->objects.find(currentObject_);
+      if (it != group->objects.end() && it->second) {
+        it->second->complete = true;
+      }
     }
     return consumer_->objectPayload(std::move(payload), finSubgroup);
   }
 
   folly::Expected<folly::Unit, MoQPublishError> endOfGroup(
       uint64_t endOfGroupObjectID) override {
-    auto res = cacheTrack_.updateLargest({group_, endOfGroupObjectID});
-    if (!res) {
-      return res;
-    }
-    auto cacheRes = cacheGroup_.cacheObject(
-        subgroup_,
-        endOfGroupObjectID,
-        ObjectStatus::END_OF_GROUP,
-        noExtensions(),
-        nullptr,
-        true);
-    if (cacheRes.hasError()) {
-      return cacheRes;
+    auto track = cacheTrack_.lock();
+    auto group = cacheGroup_.lock();
+    if (track && group) {
+      auto res = track->updateLargest({group_, endOfGroupObjectID});
+      if (!res) {
+        return res;
+      }
+      auto cacheRes = group->cacheObject(
+          subgroup_,
+          endOfGroupObjectID,
+          ObjectStatus::END_OF_GROUP,
+          noExtensions(),
+          nullptr,
+          true);
+      if (cacheRes.hasError()) {
+        return cacheRes;
+      }
     }
     return consumer_->endOfGroup(endOfGroupObjectID);
   }
 
   folly::Expected<folly::Unit, MoQPublishError> endOfTrackAndGroup(
       uint64_t endOfTrackObjectID) override {
-    auto res = cacheTrack_.updateLargest({group_, endOfTrackObjectID}, true);
-    if (!res) {
-      return res;
-    }
-    auto cacheRes = cacheGroup_.cacheObject(
-        subgroup_,
-        endOfTrackObjectID,
-        ObjectStatus::END_OF_TRACK,
-        noExtensions(),
-        nullptr,
-        true);
-    if (cacheRes.hasError()) {
-      return cacheRes;
+    auto track = cacheTrack_.lock();
+    auto group = cacheGroup_.lock();
+    if (track && group) {
+      auto res = track->updateLargest({group_, endOfTrackObjectID}, true);
+      if (!res) {
+        return res;
+      }
+      auto cacheRes = group->cacheObject(
+          subgroup_,
+          endOfTrackObjectID,
+          ObjectStatus::END_OF_TRACK,
+          noExtensions(),
+          nullptr,
+          true);
+      if (cacheRes.hasError()) {
+        return cacheRes;
+      }
     }
     return consumer_->endOfTrackAndGroup(endOfTrackObjectID);
   }
@@ -394,19 +444,26 @@ class MoQCache::SubgroupWriteback : public SubgroupConsumer {
   uint64_t group_;
   uint64_t subgroup_;
   std::shared_ptr<SubgroupConsumer> consumer_;
-  CacheTrack& cacheTrack_;
-  CacheGroup& cacheGroup_;
+  std::weak_ptr<CacheTrack> cacheTrack_;
+  std::weak_ptr<CacheGroup> cacheGroup_;
   uint64_t currentObject_{0};
   uint64_t currentLength_{0};
 };
 
 // Caches incoming objects from a subscription and forwards to the consumer.
 // Also maintains the "live" bit for tracks in the cache.
+//
+// JEKET fork: holds a std::shared_ptr<CacheTrack> instead of a reference so
+// that the lifetime of the track is tied to any active subscribe-writeback,
+// AND so that each SubgroupWriteback created in beginSubgroup can weak_ptr
+// the track safely. See Jeket-com/JSS#51.
 class MoQCache::SubscribeWriteback : public TrackConsumer {
  public:
-  SubscribeWriteback(std::shared_ptr<TrackConsumer> consumer, CacheTrack& track)
-      : consumer_(std::move(consumer)), track_(track) {
-    track_.isLive = true;
+  SubscribeWriteback(
+      std::shared_ptr<TrackConsumer> consumer,
+      std::shared_ptr<CacheTrack> track)
+      : consumer_(std::move(consumer)), track_(std::move(track)) {
+    track_->isLive = true;
   }
   SubscribeWriteback() = delete;
   SubscribeWriteback(const SubscribeWriteback&) = delete;
@@ -415,7 +472,9 @@ class MoQCache::SubscribeWriteback : public TrackConsumer {
   SubscribeWriteback& operator=(SubscribeWriteback&&) = delete;
 
   ~SubscribeWriteback() override {
-    track_.isLive = false;
+    if (track_) {
+      track_->isLive = false;
+    }
   }
 
   folly::Expected<folly::Unit, MoQPublishError> setTrackAlias(
@@ -433,7 +492,7 @@ class MoQCache::SubscribeWriteback : public TrackConsumer {
           subgroupID,
           std::move(res.value()),
           track_,
-          track_.getOrCreateGroup(groupID));
+          track_->getOrCreateGroupShared(groupID));
     } else {
       return res;
     }
@@ -447,12 +506,12 @@ class MoQCache::SubscribeWriteback : public TrackConsumer {
   folly::Expected<folly::Unit, MoQPublishError> objectStream(
       const ObjectHeader& header,
       Payload payload) override {
-    auto res = track_.updateLargest(
+    auto res = track_->updateLargest(
         {header.group, header.id}, isEndOfTrack(header.status));
     if (!res) {
       return res;
     }
-    auto cacheRes = track_.getOrCreateGroup(header.group)
+    auto cacheRes = track_->getOrCreateGroup(header.group)
                         .cacheObject(
                             header.subgroup,
                             header.id,
@@ -469,12 +528,12 @@ class MoQCache::SubscribeWriteback : public TrackConsumer {
   folly::Expected<folly::Unit, MoQPublishError> datagram(
       const ObjectHeader& header,
       Payload payload) override {
-    auto res = track_.updateLargest(
+    auto res = track_->updateLargest(
         {header.group, header.id}, isEndOfTrack(header.status));
     if (!res) {
       return res;
     }
-    auto cacheRes = track_.getOrCreateGroup(header.group)
+    auto cacheRes = track_->getOrCreateGroup(header.group)
                         .cacheObject(
                             header.subgroup,
                             header.id,
@@ -490,11 +549,11 @@ class MoQCache::SubscribeWriteback : public TrackConsumer {
 
   folly::Expected<folly::Unit, MoQPublishError>
   groupNotExists(uint64_t groupID, uint64_t subgroup, Priority pri) override {
-    auto res = track_.updateLargest({groupID, 0});
+    auto res = track_->updateLargest({groupID, 0});
     if (!res) {
       return res;
     }
-    track_.getOrCreateGroup(groupID).cacheMissingStatus(
+    track_->getOrCreateGroup(groupID).cacheMissingStatus(
         0, ObjectStatus::GROUP_NOT_EXIST);
     return consumer_->groupNotExists(groupID, subgroup, pri);
   }
@@ -506,7 +565,9 @@ class MoQCache::SubscribeWriteback : public TrackConsumer {
 
  private:
   std::shared_ptr<TrackConsumer> consumer_;
-  CacheTrack& track_;
+  // JEKET fork: shared_ptr so SubgroupWriteback children can weak_ptr it
+  // and survive MoQCache::clearTrack() eviction. See Jeket-com/JSS#51.
+  std::shared_ptr<CacheTrack> track_;
 };
 
 // Caches incoming objects and forwards them to the consumer. Handles gaps in
@@ -839,8 +900,10 @@ std::shared_ptr<TrackConsumer> MoQCache::getSubscribeWriteback(
   if (trackIt == cache_.end()) {
     trackIt = cache_.emplace(ftn, std::make_shared<CacheTrack>()).first;
   }
+  // JEKET fork: pass shared_ptr<CacheTrack> so SubscribeWriteback can pass
+  // weak_ptrs to SubgroupWriteback children. See Jeket-com/JSS#51.
   return std::make_shared<SubscribeWriteback>(
-      std::move(consumer), *trackIt->second);
+      std::move(consumer), trackIt->second);
 }
 
 folly::coro::Task<Publisher::FetchResult> MoQCache::fetch(

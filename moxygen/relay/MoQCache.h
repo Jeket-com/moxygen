@@ -110,6 +110,12 @@ class MoQCache {
         AbsoluteLocation current,
         bool endOfTrack = false);
     CacheGroup& getOrCreateGroup(uint64_t groupID);
+    // JEKET fork: shared_ptr variant for weak-reference lifetime tracking in
+    // SubgroupWriteback. The MoQCache may `clearTrack()` (Jeket fork eviction
+    // path) while the publisher's stream reader still holds a SubgroupWriteback
+    // shared_ptr, so the writeback must hold a weak_ptr<CacheGroup> and lock()
+    // it per-call. See Jeket-com/JSS#51.
+    std::shared_ptr<CacheGroup> getOrCreateGroupShared(uint64_t groupID);
   };
 
   // Group-order-aware iterator for traversing groups (objects within groups
