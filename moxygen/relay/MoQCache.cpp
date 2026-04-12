@@ -760,7 +760,16 @@ class MoQCache::FetchWriteback : public FetchConsumer {
       Payload payload,
       bool finFetch) override {
     auto& group = fetchRangeIt_.track->getOrCreateGroup(fetchRangeIt_->group);
-    auto& object = group.objects[fetchRangeIt_->object];
+    // Use find() instead of operator[] to avoid default-constructing a
+    // nullptr unique_ptr<CacheEntry> when the key doesn't exist. The old
+    // code would SIGSEGV dereferencing object->payload on a null entry.
+    auto it = group.objects.find(fetchRangeIt_->object);
+    if (it == group.objects.end() || !it->second) {
+      // Object not in cache yet — create it
+      group.objects[fetchRangeIt_->object] = std::make_unique<CacheEntry>();
+      it = group.objects.find(fetchRangeIt_->object);
+    }
+    auto& object = it->second;
     if (object->payload) {
       object->payload->appendChain(payload->clone());
     } else {
