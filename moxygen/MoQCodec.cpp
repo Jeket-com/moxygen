@@ -279,10 +279,13 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
               cursor, remainingLength, curObjectHeader_, subgroupOptions_);
         }
         if (res.hasError()) {
-          XLOG(ERR) << "[JEKET-DIAG] parseObjectHeader failed err="
-                    << uint32_t(res.error())
-                    << " streamType=" << uint32_t(streamType_)
-                    << " streamId=" << streamId_;
+          // Downgrade to DBG: err=4294967295 (QUIC default-close) floods
+          // relay logs during normal session churn (ABR tier cycling,
+          // viewer disconnect, moq_ingress redeploy). Not actionable.
+          XLOG(DBG1) << "[JEKET-DIAG] parseObjectHeader failed err="
+                     << uint32_t(res.error())
+                     << " streamType=" << uint32_t(streamType_)
+                     << " streamId=" << streamId_;
           connError_ = res.error();
           break;
         }
