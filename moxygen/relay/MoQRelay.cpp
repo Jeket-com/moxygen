@@ -329,17 +329,34 @@ Subscriber::PublishResult MoQRelay::publish(
   auto session = MoQSession::getRequestSession();
   bool wasEmpty = !nodePtr->hasLocalSessions();
 
+  std::shared_ptr<MoQForwarder> migratedForwarder;
   auto it = subscriptions_.find(pub.fullTrackName);
   if (it != subscriptions_.end()) {
-    // someone already announced this FTN, we don't support multipublisher
-    XLOG(DBG1) << "New publisher for existing subscription";
-    nodePtr->publishes.erase(pub.fullTrackName.trackName);
-    it->second.handle->unsubscribe();
-    it->second.forwarder->subscribeDone(
-        {RequestID(0),
-         SubscribeDoneStatusCode::SUBSCRIPTION_ENDED,
-         0, // filled in by session
-         "upstream disconnect"});
+    // Check if same session is transitioning from SUBSCRIBE-mode
+    // (created by a downstream subscriber like moq_ingress) to
+    // PUBLISH-mode (browser's PUBLISH arriving after camera init).
+    // This is NOT a multipublisher collision — it's the same publisher
+    // upgrading. Migrate the existing forwarder (with its subscribers)
+    // instead of tearing it down, which would kill active subscriptions
+    // with reset_stream error=3 (CANCELLED).
+    if (it->second.upstream.get() == session.get()) {
+      XLOG(INFO) << "[JEKET] Same-session SUBSCRIBE→PUBLISH migration for "
+                 << pub.fullTrackName << " — preserving "
+                 << it->second.forwarder->numForwardingSubscribers()
+                 << " subscriber(s)";
+      migratedForwarder = it->second.forwarder;
+      it->second.handle->unsubscribe();  // cancel now-redundant upstream subscribe
+    } else {
+      // Different publisher — original teardown logic
+      XLOG(DBG1) << "New publisher for existing subscription (different session)";
+      nodePtr->publishes.erase(pub.fullTrackName.trackName);
+      it->second.handle->unsubscribe();
+      it->second.forwarder->subscribeDone(
+          {RequestID(0),
+           SubscribeDoneStatusCode::SUBSCRIPTION_ENDED,
+           0, // filled in by session
+           "upstream disconnect"});
+    }
     XLOG(DBG4) << "Erasing subscription to " << it->first;
     subscriptions_.erase(it);
   }
@@ -361,9 +378,11 @@ Subscriber::PublishResult MoQRelay::publish(
     nodePtr->parent_->incrementActiveChildren();
   }
 
-  // Create Forwarder for this publish
-  auto forwarder =
-      std::make_shared<MoQForwarder>(pub.fullTrackName, folly::none);
+  // Create Forwarder for this publish — or reuse migrated one from
+  // a same-session SUBSCRIBE→PUBLISH transition (preserves subscribers)
+  auto forwarder = migratedForwarder
+      ? migratedForwarder
+      : std::make_shared<MoQForwarder>(pub.fullTrackName, folly::none);
 
   // Set Forwarder Params
   forwarder->setGroupOrder(pub.groupOrder);
