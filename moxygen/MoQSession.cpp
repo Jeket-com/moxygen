@@ -590,9 +590,10 @@ void StreamPublisherImpl::setWriteHandle(
   cancelCallback_.emplace(writeHandle_->getCancelToken(), [this] {
     if (writeHandle_) {
       auto* ex = writeHandle_->exception();
-      XLOG(DBG0) << "Peer requested write termination id="
-                 << writeHandle_->getID() << " code=" << (ex ? ex->what() : "")
-                 << " sgp=" << this;
+      XLOG(ERR) << "[JEKET-PIP-DEBUG] Peer requested write termination id="
+                << writeHandle_->getID() << " code=" << (ex ? ex->what() : "")
+                << " sgp=" << this
+                << " — sending CANCELLED reset. Check subscriber session.";
       reset(ResetStreamErrorCode::CANCELLED);
     }
   });

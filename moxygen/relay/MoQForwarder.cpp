@@ -69,6 +69,11 @@ MoQForwarder::SubgroupForwarder::forEachSubscriberSubgroup(
         auto res = sub->trackConsumer->beginSubgroup(
             identifier_.group, identifier_.subgroup, priority_);
         if (res.hasError()) {
+          XLOG(ERR) << "[JEKET-PIP-DEBUG] beginSubgroup FAILED for subscriber"
+                    << " group=" << identifier_.group
+                    << " subgroup=" << identifier_.subgroup
+                    << " err=" << res.error().what()
+                    << " callsite=" << callsite;
           forwarder_.removeSubscriberOnError(*sub, res.error(), callsite);
         } else {
           auto emplaceRes = sub->subgroups.emplace(identifier_, res.value());
