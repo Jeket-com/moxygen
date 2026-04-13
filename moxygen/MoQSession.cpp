@@ -2895,9 +2895,18 @@ folly::coro::Task<void> MoQSession::unidirectionalReadLoop(
     XLOG(DBG1) << "exit " << func << " id=" << id << " sess=" << this;
   });
 
-  // Add cancellation callback to null out readHandle on cancellation
-  folly::CancellationCallback cancelCb(
-      rhToken, [&readHandle]() { readHandle = nullptr; });
+  // Add cancellation callback to cleanly close the stream on cancellation.
+  // Must send STOP_SENDING BEFORE nulling readHandle — otherwise the
+  // scope guard at exit sees null and skips STOP_SENDING, leaving the
+  // QUIC stream open and leaking uni stream credits. Over hours, leaked
+  // credits exhaust the initial MAX_STREAMS window and the publisher
+  // (egress) can't create new streams → broadcast freezes.
+  folly::CancellationCallback cancelCb(rhToken, [&readHandle]() {
+    if (readHandle) {
+      readHandle->stopSending(0);
+    }
+    readHandle = nullptr;
+  });
 
   // Scope guard to unify stopSending on exit if readHandle is still valid
   auto stopSendingGuard = folly::makeGuard([&readHandle, sess = this]() {
