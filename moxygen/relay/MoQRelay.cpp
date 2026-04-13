@@ -1011,7 +1011,7 @@ void MoQRelay::onEmpty(MoQForwarder* forwarder) {
   }
 
   // Handle exists - just last subscriber left
-  XLOG(INFO) << "Last subscriber removed for " << subscriptionIt->first;
+  XLOG(DBG2) << "Last subscriber removed for " << subscriptionIt->first;
   if (subscription.isPublish) {
     // JEKET fork: do NOT send SUBSCRIBE_UPDATE forward=false to the
     // publisher when the last downstream subscriber leaves. Upstream
