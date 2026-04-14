@@ -53,6 +53,10 @@ class MoQForwarder
     return largest_;
   }
 
+  bool isDraining() const {
+    return draining_;
+  }
+
   class Callback {
    public:
     virtual ~Callback() = default;

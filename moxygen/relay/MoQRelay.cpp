@@ -1014,6 +1014,19 @@ void MoQRelay::onEmpty(MoQForwarder* forwarder) {
   // JEKET: suppressed — fires every second per unsubscribed ABR tier,
   // drowns all diagnostic output in production logs.
   // XLOG(DBG2) << "Last subscriber removed for " << subscriptionIt->first;
+
+  // JEKET fork: if the forwarder is draining (upstream subscribeDone was
+  // received, e.g. from a publisher session rotation), erase the stale
+  // subscription so a new publisher can recreate it with a fresh forwarder.
+  // Without this, draining_ is permanent and no new viewer can ever
+  // subscribe to this track — the relay becomes stuck until restarted.
+  if (forwarder->isDraining()) {
+    XLOG(INFO) << "Erasing drained subscription for " << subscriptionIt->first;
+    subscription.handle->unsubscribe();
+    subscriptions_.erase(subscriptionIt);
+    return;
+  }
+
   if (subscription.isPublish) {
     // JEKET fork: do NOT send SUBSCRIBE_UPDATE forward=false to the
     // publisher when the last downstream subscriber leaves. Upstream
