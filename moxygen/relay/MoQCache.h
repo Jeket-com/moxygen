@@ -52,6 +52,7 @@ class MoQCache {
 
   // Entry for single cached object
   struct CacheEntry {
+    CacheEntry() = default;
     CacheEntry(
         uint64_t inSubgroup,
         ObjectStatus inStatus,
