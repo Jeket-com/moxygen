@@ -90,7 +90,10 @@ folly::Try<ServerSetup> MoQServerBase::onClientSetup(
 
   // TODO: Make the default MAX_REQUEST_ID configurable and
   // take in the value from ClientSetup
-  static constexpr size_t kDefaultMaxRequestID = 100;
+  // JEKET fork: bumped from 100 to 1M. ABR tier churn creates/destroys
+  // subscriptions rapidly and request IDs are never recycled (monotonic).
+  // 100 IDs exhaust in minutes, killing the publisher session.
+  static constexpr size_t kDefaultMaxRequestID = 1000000;
   static constexpr size_t kMaxAuthTokenCacheSize = 1024;
   ServerSetup serverSetup{
       negotiatedVersion,

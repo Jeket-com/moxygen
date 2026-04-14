@@ -110,7 +110,8 @@ ClientSetup MoQClientBase::getClientSetup(
   // Setup MoQSession parameters
   // TODO: maybe let the caller set max subscribes.  Any client that publishes
   // via relay needs to support subscribes.
-  const uint32_t kDefaultMaxRequestID = 100;
+  // JEKET fork: bumped from 100 to 1M (same rationale as MoQServerBase)
+  const uint32_t kDefaultMaxRequestID = 1000000;
   const uint32_t kMaxAuthTokenCacheSize = 1024;
 
   const auto& legacyVersions = getSupportedLegacyVersions();
