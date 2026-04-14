@@ -709,12 +709,16 @@ StreamPublisherImpl::validateObjectPublishAndUpdateState(
         MoQPublishError(MoQPublishError::API_ERROR, "Not publishing object"));
   }
   if (length > *currentLengthRemaining_) {
-    XLOG(ERR) << "Length=" << length
-              << " exceeds remaining=" << *currentLengthRemaining_
-              << " sgp=" << this;
-    reset(ResetStreamErrorCode::INTERNAL_ERROR);
-    return folly::makeUnexpected(MoQPublishError(
-        MoQPublishError::API_ERROR, "Length exceeds remaining in object"));
+    // JEKET: Tolerate length overflow from publishers that declare
+    // incorrect object lengths (e.g. Meta moq-encoder-player MOQMI
+    // sender doesn't account for extension headers in the payload
+    // length). Instead of killing the subscription, adjust remaining
+    // upward so data continues to flow. The QUIC stream FIN marks
+    // the real end of the object regardless of the declared length.
+    XLOG(WARN) << "Length=" << length
+               << " exceeds remaining=" << *currentLengthRemaining_
+               << " sgp=" << this << " — adjusting (tolerant mode)";
+    *currentLengthRemaining_ = length;
   }
   *currentLengthRemaining_ -= length;
   if (*currentLengthRemaining_ == 0) {
@@ -2740,8 +2744,14 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
     if (!res) {
       return MoQCodec::ParseResult::ERROR_TERMINATE;
     } else {
-      // TODO: CHECK seems too aggressive
-      XCHECK_EQ(objectComplete, res.value() == ObjectPublishStatus::DONE);
+      // JEKET fork: downgraded from XCHECK to warning. The MOQMI extension
+      // header length tolerance fix can cause objectComplete to disagree
+      // with the consumer's DONE state. Aborting here kills the bridge.
+      if (objectComplete != (res.value() == ObjectPublishStatus::DONE)) {
+        XLOG(WARN) << "objectComplete=" << objectComplete
+                   << " but consumer status=" << static_cast<int>(res.value())
+                   << " (mismatch, continuing)";
+      }
     }
     return MoQCodec::ParseResult::CONTINUE;
   }
