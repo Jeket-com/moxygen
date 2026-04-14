@@ -69,6 +69,14 @@ MoQForwarder::SubgroupForwarder::forEachSubscriberSubgroup(
         auto res = sub->trackConsumer->beginSubgroup(
             identifier_.group, identifier_.subgroup, priority_);
         if (res.hasError()) {
+          if (res.error().code == MoQPublishError::BLOCKED) {
+            // JEKET fork: transient stream credit exhaustion — skip this
+            // subgroup but keep the subscriber alive.
+            XLOG(WARN) << "Stream credit exhausted in " << callsite
+                       << " group=" << identifier_.group
+                       << " sub=" << identifier_.subgroup;
+            return;
+          }
           XLOG(ERR) << "[JEKET-PIP-DEBUG] beginSubgroup FAILED for subscriber"
                     << " group=" << identifier_.group
                     << " subgroup=" << identifier_.subgroup
@@ -386,7 +394,19 @@ MoQForwarder::beginSubgroup(
     auto sgRes =
         sub->trackConsumer->beginSubgroup(groupID, subgroupID, priority);
     if (sgRes.hasError()) {
-      removeSubscriberOnError(*sub, sgRes.error(), "beginSubgroup");
+      if (sgRes.error().code == MoQPublishError::BLOCKED) {
+        // JEKET fork: stream credit exhaustion is transient — the browser
+        // reclaims credits as completed uni streams are acknowledged.
+        // Don't kill the subscriber; skip this group and it will receive
+        // the next one when credits become available.  Without this,
+        // audio's ~50 groups/sec exhausts Chrome's initial MAX_STREAMS_UNI
+        // (~100) in ~2 seconds, permanently killing video+audio forwarding.
+        XLOG(WARN) << "Stream credit exhausted for subscriber, skipping"
+                   << " group=" << groupID << " sub=" << subgroupID
+                   << " (subscriber kept alive)";
+      } else {
+        removeSubscriberOnError(*sub, sgRes.error(), "beginSubgroup");
+      }
     } else {
       sub->subgroups[subgroupIdentifier] = sgRes.value();
     }
