@@ -704,9 +704,17 @@ StreamPublisherImpl::validateObjectPublishAndUpdateState(
     bool finStream) {
   auto length = payload ? payload->computeChainDataLength() : 0;
   if (!currentLengthRemaining_) {
-    XLOG(ERR) << "Not publishing object sgp=" << this;
-    return folly::makeUnexpected(
-        MoQPublishError(MoQPublishError::API_ERROR, "Not publishing object"));
+    // JEKET: Downgrade from fatal to skip. This fires when beginObject
+    // failed asynchronously (e.g., write error / stream credit exhaustion)
+    // but the subscriber hasn't been removed yet from the forwarder's
+    // subscriber set. The pending .onError from beginObject will clean up
+    // the subscriber. Returning DONE (not an error) prevents
+    // removeSubscriberOnError from sending SubscribeDone(INTERNAL_ERROR)
+    // which kills the subscriber's entire subscription — e.g., the
+    // moq_ingress PIP pipeline dies after just a few seconds.
+    XLOG(WARN) << "objectPayload with no active object sgp=" << this
+               << " — skipping (beginObject likely failed async)";
+    return ObjectPublishStatus::DONE;
   }
   if (length > *currentLengthRemaining_) {
     // JEKET: Tolerate length overflow from publishers that declare
