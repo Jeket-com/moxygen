@@ -19,6 +19,21 @@ void MoQCodec::onIngressStart(std::unique_ptr<folly::IOBuf> data) {
 MoQCodec::ParseResult MoQControlCodec::onIngress(
     std::unique_ptr<folly::IOBuf> data,
     bool eom) {
+  // JEKET DEBUG: hex dump first bytes of control stream ingress
+  if (data && data->length() > 0) {
+    std::string hex;
+    auto* p = data->data();
+    size_t n = std::min(data->length(), size_t(64));
+    for (size_t i = 0; i < n; i++) {
+      char buf[4];
+      snprintf(buf, sizeof(buf), "%02x ", p[i]);
+      hex += buf;
+    }
+    XLOG(INFO) << "[JEKET-WT-DEBUG] Control ingress streamID=" << streamId_
+               << " len=" << data->length() << " eom=" << eom
+               << " parseState=" << (int)parseState_
+               << " hex=[" << hex << "]";
+  }
   onIngressStart(std::move(data));
   size_t remainingLength = ingress_.chainLength();
   folly::io::Cursor cursor(ingress_.front());
@@ -33,11 +48,16 @@ MoQCodec::ParseResult MoQControlCodec::onIngress(
         }
         curFrameType_ = FrameType(type->first);
         remainingLength -= type->second;
+        XLOG(INFO) << "[JEKET-WT-DEBUG] Parsed frame type=0x" << std::hex
+                   << (uint64_t)curFrameType_ << std::dec
+                   << " remaining=" << remainingLength
+                   << " streamID=" << streamId_;
         auto res = checkFrameAllowed(curFrameType_);
         if (!res) {
-          XLOG(DBG4) << "Frame not allowed: 0x" << std::setfill('0')
-                     << std::setw(sizeof(uint64_t) * 2) << std::hex
-                     << (uint64_t)curFrameType_ << " on streamID=" << streamId_;
+          XLOG(ERR) << "[JEKET-WT-DEBUG] Frame NOT allowed: 0x" << std::hex
+                    << (uint64_t)curFrameType_ << std::dec
+                    << " streamID=" << streamId_
+                    << " version=" << (moqFrameParser_.getVersion().hasValue() ? std::to_string(*moqFrameParser_.getVersion()) : "none");
           connError_.emplace(ErrorCode::PROTOCOL_VIOLATION);
           break;
         }
@@ -134,7 +154,19 @@ void MoQCodec::onIngressEnd(
       ingress_.trimStart(ingress_.chainLength() - remainingLength);
       connError_.reset();
       return;
-    } else if (callback) {
+    }
+    // JEKET: err=4294967295 (0xFFFFFFFF) is the QUIC default-close code.
+    // This fires when a subscriber disconnects mid-stream — normal
+    // operation during ABR tier cycling, viewer disconnect, pod restart.
+    // Do NOT escalate to onConnectionError (which kills the session).
+    // Just clean up this stream silently.
+    if (uint32_t(*connError_) == 0xFFFFFFFF) {
+      XLOG(DBG2) << "Stream closed (QUIC default-close) streamId="
+                  << streamId_ << " — not escalating";
+      connError_.reset();
+      return;
+    }
+    if (callback) {
       XLOG(ERR) << "Conn error=" << uint32_t(*connError_);
       callback->onConnectionError(*connError_);
     }
