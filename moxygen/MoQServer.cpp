@@ -271,6 +271,13 @@ void MoQServer::Handler::onHeadersComplete(
       VLOG(4) << "Failed to negotiate WebTransport protocol";
       resp.setStatusCode(400);
     }
+  } else {
+    // JEKET: Firefox doesn't send Sec-WebTransport-Protocol headers.
+    // Default to the legacy protocol so the codec uses the right framing.
+    if (!supportedProtocols.empty()) {
+      negotiatedProtocol = supportedProtocols.back(); // legacy is last
+      XLOG(INFO) << "WebTransport: no protocols offered by client — defaulting to " << *negotiatedProtocol;
+    }
   }
   txn_->sendHeaders(resp);
   auto wt = txn_->getWebTransport();
