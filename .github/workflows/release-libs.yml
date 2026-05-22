@@ -1,0 +1,119 @@
+name: Release multi-arch moxygen libs image
+
+# Publishes a pre-built moxygen build-artifact image to GHCR so that
+# downstream consumers (notably JBS and Jeket-com/nmos-cpp) don't have to
+# rebuild folly + the Meta dependency stack on every commit.
+#
+# The image is heavy on purpose: it contains the installed prefix
+# (/opt/moxygen) AND the uninstalled object files (/opt/moxygen-build/
+# build/moxygen) AND the source tree (/opt/moxygen-src). Downstreams need
+# all three:
+#   - /opt/moxygen          → cmake configs for folly/fizz/mvfst/proxygen/wangle
+#   - /opt/moxygen-build/*  → libmoxygen*.a object files (not installed
+#                             by getdeps.py but linked by JBS C++ services)
+#   - /opt/moxygen-src      → source headers (#include moxygen/...)
+#
+# Naming: this is the "libs" image. The existing docker-build-amd64.yml +
+# docker-build-arm64.yml workflows produce the runtime `moqrelay` binary
+# image — a different artifact for a different consumer.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish (e.g. v0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/jeket-com/moxygen-libs
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runs-on: jbs-dev-runners
+            arch: amd64
+            platform: linux/amd64
+          - runs-on: jbs-prod-runners
+            arch: arm64
+            platform: linux/arm64
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
+
+      - name: Verify BuildKit reachable
+        env:
+          BUILDKIT_HOST: tcp://buildkitd.buildkit.svc.cluster.local:1234
+        run: |
+          buildctl --addr "$BUILDKIT_HOST" debug workers \
+            || (echo "::error::BuildKit not reachable at $BUILDKIT_HOST" && exit 1)
+
+      - name: Set up buildx (in-cluster BuildKit)
+        env:
+          BUILDKIT_HOST: tcp://buildkitd.buildkit.svc.cluster.local:1234
+        run: |
+          BUILDER="moxygen-libs-${{ matrix.arch }}"
+          if ! docker buildx inspect "$BUILDER" >/dev/null 2>&1; then
+            docker buildx create --name "$BUILDER" --driver remote --use "$BUILDKIT_HOST"
+          else
+            docker buildx use "$BUILDER"
+          fi
+
+      - name: Build + push single-arch image
+        run: |
+          docker buildx build \
+            --platform ${{ matrix.platform }} \
+            --file docker/Dockerfile.libs \
+            --tag ${{ env.IMAGE }}:${{ steps.tag.outputs.tag }}-${{ matrix.arch }} \
+            --push \
+            .
+
+  fuse:
+    name: Fuse multi-arch manifest
+    needs: build
+    runs-on: jbs-dev-runners
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
+
+      - name: Create multi-arch manifest
+        env:
+          BUILDKIT_HOST: tcp://buildkitd.buildkit.svc.cluster.local:1234
+        run: |
+          docker buildx imagetools create \
+            -t ${{ env.IMAGE }}:${{ steps.tag.outputs.tag }} \
+            ${{ env.IMAGE }}:${{ steps.tag.outputs.tag }}-amd64 \
+            ${{ env.IMAGE }}:${{ steps.tag.outputs.tag }}-arm64
+
+      - name: Verify multi-arch index
+        run: |
+          docker buildx imagetools inspect ${{ env.IMAGE }}:${{ steps.tag.outputs.tag }}
