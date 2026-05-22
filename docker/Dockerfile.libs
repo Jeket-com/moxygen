@@ -34,7 +34,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         gcc \
         gdb \
         git \
+        gperf \
+        libaio-dev \
         libboost-all-dev \
+        libbz2-dev \
         libdouble-conversion-dev \
         libdwarf-dev \
         libevent-dev \
@@ -73,7 +76,8 @@ COPY . /moxygen
 #   --install-prefix   Clean paths (no content-hash dirs).
 #   --src-dir          Tells getdeps.py to use our checkout instead of
 #                      cloning moxygen again from upstream.
-RUN ./build/fbcode_builder/getdeps.py build \
+RUN ./build/fbcode_builder/getdeps.py install-system-deps --recursive moxygen || true && \
+    ./build/fbcode_builder/getdeps.py build \
         --allow-system-packages \
         --num-jobs 8 \
         --no-tests \
@@ -104,7 +108,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         g++ \
         gcc \
         git \
+        gperf \
+        libaio-dev \
         libboost-all-dev \
+        libbz2-dev \
         libdouble-conversion-dev \
         libdwarf-dev \
         libevent-dev \
