@@ -4484,13 +4484,15 @@ void MoQFrameWriter::writeKeyValuePairs(
     if (ext.isOddType()) {
       // odd = length prefix
       if (ext.arrayValue) {
-        writeVarint(
-            writeBuf, ext.arrayValue->computeChainDataLength(), size, error);
+        // Cache the length so the varint prefix and the size accounting can
+        // never disagree (computeChainDataLength walks the chain each call).
+        const size_t arrayLen = ext.arrayValue->computeChainDataLength();
+        writeVarint(writeBuf, arrayLen, size, error);
         if (error) {
           return;
         }
         writeBuf.append(ext.arrayValue->clone());
-        size += ext.arrayValue->computeChainDataLength();
+        size += arrayLen;
       } else {
         writeVarint(writeBuf, 0, size, error);
       }
