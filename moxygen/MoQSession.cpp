@@ -2997,7 +2997,16 @@ folly::coro::Task<void> MoQSession::controlReadLoop(
       XLOG(DBG3) << "End of stream id=" << streamId << " sess=" << this;
     }
   }
-  // TODO: close session on control exit.
+  // The SESSION control stream (codec == nullptr -> controlCodec_) ending is
+  // fatal: without closing here the session lingers half-dead and the peer's
+  // application never learns it must reconnect. Draft-18 bidi REQUEST streams
+  // (control != nullptr) terminate per-request below instead.
+  if (!codec && !token.isCancellationRequested() &&
+      !cancellationSource_.isCancellationRequested()) {
+    XLOG(ERR) << "Control stream ended unexpectedly, closing session"
+              << " fin=" << fin << " id=" << streamId << " sess=" << this;
+    close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
+  }
   // On read-loop exit, fire responder close (RST always; FIN when
   // finIsCancellation) and fail any still-pending sender request. Both
   // suppressed during shutdown — cleanup() delivers the canonical error.
