@@ -35,6 +35,29 @@ class MoQRelay : public Publisher,
     allowedNamespacePrefix_ = std::move(allowed);
   }
 
+  // Eager forwarding (a.k.a. "origin subscribe relay" mode). Off by default,
+  // which preserves the stock demand-driven behavior: the relay only tells an
+  // upstream publisher to forward (forward=true) once it has a downstream
+  // forwarding subscriber, and drops back to forward=false when the last one
+  // leaves.
+  //
+  // When on, every PUBLISHed track is ingested unconditionally — the relay
+  // replies forward=true on PUBLISH and never toggles the upstream back to
+  // forward=false on subscriber churn. This is what a broadcast origin relay
+  // needs: it must ingest ALL tracks the publisher offers (video, audio, and
+  // the retained data/catalog track) regardless of who is currently watching,
+  // so it can package CMAF/HLS/DASH and serve late-joining or snapshot-style
+  // (LARGEST_OBJECT) MoQ subscribers from a continuously-fed forwarder.
+  //
+  // Without this, a track whose only consumer subscribes with LARGEST_OBJECT /
+  // forward=false (e.g. shaka-player's catalog subscribe) never raises the
+  // forwarding-subscriber count, so the upstream stays forward=false, the
+  // publisher can never deliver the object, and the subscribe deadlocks
+  // (relay has no content → RESET_STREAM → subscriber never counts → …).
+  void setEagerForwarding(bool eager) {
+    eagerForwarding_ = eager;
+  }
+
   folly::coro::Task<SubscribeResult> subscribe(
       SubscribeRequest subReq,
       std::shared_ptr<TrackConsumer> consumer) override;
@@ -400,6 +423,8 @@ class MoQRelay : public Publisher,
   void wakePendingRendezvousUnderNamespace(const TrackNamespace& ns);
 
   TrackNamespace allowedNamespacePrefix_;
+  // See setEagerForwarding(). Off preserves stock demand-driven forwarding.
+  bool eagerForwarding_{false};
   folly::F14FastMap<FullTrackName, RelaySubscription, FullTrackName::hash>
       subscriptions_;
   PendingRendezvousNode pendingRendezvousRoot_;

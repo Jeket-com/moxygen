@@ -569,7 +569,11 @@ Subscriber::PublishResult MoQRelay::publish(
       filter, // Return filter, not forwarder directly
       folly::coro::makeTask<folly::Expected<PublishOk, PublishError>>(PublishOk{
           pub.requestID,
-          /*forward=*/(nSubscribers > 0),
+          // Eager forwarding (broadcast origin relay): ingest every PUBLISHed
+          // track unconditionally so a track whose only consumer subscribes
+          // with LARGEST_OBJECT/forward=false (e.g. a retained catalog) is
+          // still fed. See setEagerForwarding().
+          /*forward=*/(eagerForwarding_ || nSubscribers > 0),
           kDefaultPriority,
           pub.groupOrder,
           LocationType::AbsoluteRange,
@@ -1927,6 +1931,14 @@ void MoQRelay::onEmpty(MoQForwarder* forwarder) {
   // Handle exists - just last subscriber left
   XLOG(INFO) << "Last subscriber removed for " << subscriptionIt->first;
   if (subscription.isPublish) {
+    if (eagerForwarding_) {
+      // Broadcast origin relay: keep ingesting the PUBLISHed track even with
+      // no downstream subscribers, so the forwarder stays fed for late-joining
+      // or snapshot (LARGEST_OBJECT) subscribers. See setEagerForwarding().
+      XLOG(DBG1) << "Eager forwarding: keeping upstream forward=true for "
+                 << subscriptionIt->first;
+      return;
+    }
     // if it's publish, don't unsubscribe, just subscribeUpdate forward=false
     XLOG(DBG1) << "Updating upstream subscription forward=false";
     auto exec = subscription.upstream->getExecutor();
@@ -1956,6 +1968,14 @@ void MoQRelay::forwardChanged(MoQForwarder* forwarder) {
                << " - publisher terminated";
     return;
   }
+  // Eager forwarding (broadcast origin relay): never drop the upstream back to
+  // forward=false on subscriber churn — keep the track ingested. Leaving it
+  // true also avoids a needless SUBSCRIBE_UPDATE round-trip. See
+  // setEagerForwarding().
+  if (eagerForwarding_) {
+    return;
+  }
+
   XLOG(INFO) << "Updating forward for " << subscriptionIt->first
              << " numForwardingSubs=" << forwarder->numForwardingSubscribers();
 
