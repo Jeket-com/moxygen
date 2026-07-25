@@ -1,0 +1,142 @@
+# Multi-arch pre-built moxygen build-artifact image.
+#
+# Built and published by .github/workflows/release-libs.yml on tag push.
+# Consumers (JBS, Jeket-com/nmos-cpp) `FROM ghcr.io/jeket-com/moxygen-libs:<tag>`
+# at build time and `COPY --from=` the artifact directories — they get the
+# folly/fizz/mvfst/proxygen/wangle stack pre-compiled instead of running
+# getdeps.py themselves (2-3 hours of compile + link).
+#
+# Layout (consumed by JBS Dockerfile.publisher-base and CMakeLists.txt):
+#   /opt/moxygen                    installed prefix from getdeps.py
+#     - <dep>/lib/cmake/             cmake configs for each dependency
+#     - <dep>/lib/pkgconfig/         pkg-config for each dependency
+#   /opt/moxygen-build/build/moxygen uninstalled moxygen .a files
+#                                   (libmoxygen.a, libmoqrelay.a, etc.)
+#   /opt/moxygen-src                 source tree (needed for #include moxygen/...)
+#
+# Why all three? getdeps.py installs only DEPENDENCIES, not moxygen itself —
+# moxygen's own libraries live in the build dir. The source tree carries
+# public headers that downstream services include directly.
+
+FROM ubuntu:24.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+
+# Build dependencies — mirrors JBS/docker/Dockerfile.publisher-base lines 20-52.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        ccache \
+        cmake \
+        doxygen \
+        g++ \
+        gcc \
+        gdb \
+        git \
+        gperf \
+        libaio-dev \
+        libboost-all-dev \
+        libbz2-dev \
+        libdouble-conversion-dev \
+        libdwarf-dev \
+        libevent-dev \
+        libfmt-dev \
+        libgflags-dev \
+        libgoogle-glog-dev \
+        liblz4-dev \
+        liblzma-dev \
+        libsnappy-dev \
+        libsodium-dev \
+        libssl-dev \
+        libunwind-dev \
+        libzstd-dev \
+        m4 \
+        make \
+        ninja-build \
+        pkg-config \
+        python3 \
+        python3-pip \
+        sudo \
+        unzip \
+        wget \
+        xz-utils \
+        zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /moxygen
+COPY . /moxygen
+
+# Build moxygen + transitive Meta dependencies. The arg list mirrors
+# JBS/docker/Dockerfile.publisher-base lines 65-73 (the proven config):
+#   --num-jobs 8       Folly link steps need ~1-2 GiB each. 8 fits in the
+#                      16Gi buildkitd Guaranteed slice on jbs-dev; bumping
+#                      higher caused OOM kills.
+#   --no-tests         Skips heavy gtest binaries that aren't shipped.
+#   --install-prefix   Clean paths (no content-hash dirs).
+#   --src-dir          Tells getdeps.py to use our checkout instead of
+#                      cloning moxygen again from upstream.
+RUN ./build/fbcode_builder/getdeps.py install-system-deps --recursive moxygen || true && \
+    ./build/fbcode_builder/getdeps.py build \
+        --allow-system-packages \
+        --num-jobs 8 \
+        --no-tests \
+        --scratch-path /opt/moxygen-build \
+        --install-prefix /opt/moxygen \
+        --src-dir=moxygen:/moxygen \
+        moxygen
+
+# ---------------------------------------------------------------------------
+# Final stage: minimal but self-contained.
+#
+# Build-deps stay installed so downstream consumers (notably
+# Jeket-com/nmos-cpp) can FROM this image and run their own cmake/ninja
+# against folly headers without re-installing the same apt packages.
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Same apt deps as builder — present at runtime so further compilation
+# stages (nmos-cpp release.yml in particular) can extend this image
+# directly rather than re-running apt-get.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        ccache \
+        cmake \
+        g++ \
+        gcc \
+        git \
+        gperf \
+        libaio-dev \
+        libboost-all-dev \
+        libbz2-dev \
+        libdouble-conversion-dev \
+        libdwarf-dev \
+        libevent-dev \
+        libfmt-dev \
+        libgflags-dev \
+        libgoogle-glog-dev \
+        liblz4-dev \
+        liblzma-dev \
+        libsnappy-dev \
+        libsodium-dev \
+        libssl-dev \
+        libunwind-dev \
+        libzstd-dev \
+        m4 \
+        make \
+        ninja-build \
+        pkg-config \
+        python3 \
+        zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /opt/moxygen                       /opt/moxygen
+COPY --from=builder /opt/moxygen-build/build/moxygen   /opt/moxygen-build/build/moxygen
+COPY --from=builder /moxygen                            /opt/moxygen-src
+
+ENV MOXYGEN_INSTALL_BASE=/opt/moxygen \
+    MOXYGEN_ROOT=/opt/moxygen-src \
+    MOXYGEN_BUILD_DIR=/opt/moxygen-build/build/moxygen

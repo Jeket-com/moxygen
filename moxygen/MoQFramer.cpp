@@ -96,13 +96,12 @@ bool isRequestSpecificParam(moxygen::TrackRequestParamKey key) {
 }
 
 bool isValidGroupOrderParam(uint64_t value) {
-  switch (value) {
-    case folly::to_underlying(moxygen::GroupOrder::OldestFirst):
-    case folly::to_underlying(moxygen::GroupOrder::NewestFirst):
-      return true;
-    default:
-      return false;
-  }
+  // Valid values are Default (0), OldestFirst (1) and NewestFirst (2).
+  // Default is legal on the wire: our own writer omits the parameter rather
+  // than sending 0, but other implementations (e.g. shaka-player) send it
+  // explicitly to mean "use the publisher's order". resolveGroupOrder()
+  // already maps Default onto the publisher's order.
+  return value <= folly::to_underlying(moxygen::GroupOrder::NewestFirst);
 }
 
 bool isValidSubscriberPriorityParam(uint64_t value) {
@@ -821,6 +820,8 @@ MoQFrameParser::parseIntParam(
   p.asUint64 = res->first;
 
   if (!isIntParamValid(version, p.key, p.asUint64)) {
+    XLOG(ERR) << "parseIntParam: invalid value for key=" << key
+              << " value=" << p.asUint64 << " version=" << version;
     return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
   }
 
@@ -828,6 +829,8 @@ MoQFrameParser::parseIntParam(
       getDraftMajorVersion(version) <= 16 &&
       key == folly::to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT) &&
       p.asUint64 == 0) {
+    XLOG(ERR) << "parseIntParam: DELIVERY_TIMEOUT=0 is not allowed in a request"
+              << " for version " << version;
     return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
   }
   return p;
@@ -4484,13 +4487,15 @@ void MoQFrameWriter::writeKeyValuePairs(
     if (ext.isOddType()) {
       // odd = length prefix
       if (ext.arrayValue) {
-        writeVarint(
-            writeBuf, ext.arrayValue->computeChainDataLength(), size, error);
+        // Cache the length so the varint prefix and the size accounting can
+        // never disagree (computeChainDataLength walks the chain each call).
+        const size_t arrayLen = ext.arrayValue->computeChainDataLength();
+        writeVarint(writeBuf, arrayLen, size, error);
         if (error) {
           return;
         }
         writeBuf.append(ext.arrayValue->clone());
-        size += ext.arrayValue->computeChainDataLength();
+        size += arrayLen;
       } else {
         writeVarint(writeBuf, 0, size, error);
       }

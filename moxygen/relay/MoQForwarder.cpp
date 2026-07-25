@@ -42,11 +42,14 @@ folly::Expected<folly::Unit, MoQPublishError> MoQForwarder::forEachSubscriber(
     subscriberIt++;
     fn(sub);
   }
-  // Check if empty after iteration - subscribers may have been removed in loop
-  if (subscribers_.empty()) {
-    return folly::makeUnexpected(
-        MoQPublishError(MoQPublishError::CANCELLED, "No subscribers"));
-  }
+  // Subscribers may have been removed during the loop (the last one can be a
+  // ghost reaped on publish-after-done). An empty subscribers_ is a normal
+  // transient — nothing to forward — not an error: returning CANCELLED here
+  // propagates up the shared incoming stream-consume path (via the direct
+  // TrackConsumer methods beginSubgroup/groupNotExists) and resets the
+  // publisher's in-flight subgroup — the JSS#562 caption blackout. Genuine
+  // upstream teardown fires separately via checkAndFireOnEmpty →
+  // MoQRelay::onEmpty. See JSS#563.
   return folly::unit;
 }
 
@@ -65,7 +68,6 @@ MoQForwarder::SubgroupForwarder::forEachSubscriberSubgroup(
     return folly::makeUnexpected(
         MoQPublishError(MoQPublishError::CANCELLED, "No subscribers"));
   }
-  bool anyForwarded = false;
   forwarder_->forEachSubscriber([&](const std::shared_ptr<Subscriber>& sub) {
     auto subgroupConsumerIt = sub->subgroups.find(identifier_);
     if (subgroupConsumerIt != sub->subgroups.end()) {
@@ -94,7 +96,6 @@ MoQForwarder::SubgroupForwarder::forEachSubscriberSubgroup(
         closeSubgroupForSubscriber(
             sub, "SubgroupForwarder::forEachSubscriberSubgroup");
       } else {
-        anyForwarded = true;
         fn(sub, subgroupConsumerIt->second);
       }
     } else {
@@ -123,16 +124,20 @@ MoQForwarder::SubgroupForwarder::forEachSubscriberSubgroup(
       } else {
         auto emplaceRes = sub->subgroups.emplace(identifier_, res.value());
         subgroupConsumerIt = emplaceRes.first;
-        anyForwarded = true;
         fn(sub, subgroupConsumerIt->second);
       }
     }
   });
-  // Check if empty after iteration - subscribers may have been removed in loop
-  // Also check if any subscriber was actually forwarded to
-  if (!forwarder_ || forwarder_->subscribers_.empty() || !anyForwarded) {
+  // Empty subscribers_ / nothing-forwarded is a normal transient, not an error.
+  // This is the primary JSS#562 data-plane reset: CANCELLED here flows through
+  // object()/beginObject()/objectPayload() into the codec as ERROR_TERMINATE and
+  // resets the SHARED incoming egress subgroup, dropping every subsequent grain
+  // until the group rotates (minutes for a sparse caption track). Drop-to-void
+  // instead; MoQRelay::onEmpty owns real teardown. A detached forwarder is still
+  // a genuine error. See JSS#563.
+  if (!forwarder_) {
     return folly::makeUnexpected(
-        MoQPublishError(MoQPublishError::CANCELLED, "No subscribers"));
+        MoQPublishError(MoQPublishError::CANCELLED, "Forwarder detached"));
   }
   return folly::unit;
 }
