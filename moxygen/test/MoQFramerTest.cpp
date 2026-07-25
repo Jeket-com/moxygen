@@ -3548,6 +3548,49 @@ TEST_P(MoQFramerV15PlusTest, SubscribeRequestExplicitGroupOrder) {
   EXPECT_EQ(parseResult->groupOrder, GroupOrder::NewestFirst);
 }
 
+// A peer may send GROUP_ORDER explicitly as Default (0), meaning "use the
+// publisher's order" — shaka-player does this on every SUBSCRIBE. Our own
+// writer omits the parameter instead of sending 0, so craft that wire shape by
+// writing NewestFirst and rewriting the value byte in place.
+//
+// Regression test: the parser used to reject 0 with PROTOCOL_VIOLATION, which
+// tore down the control stream mid-handshake (JSS#594).
+TEST_P(MoQFramerV15PlusTest, SubscribeRequestExplicitDefaultGroupOrder) {
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+
+  SubscribeRequest req = SubscribeRequest::make(
+      FullTrackName({TrackNamespace({"ns"}), "track"}),
+      /*priority*/ 128, // default, so no SUBSCRIBER_PRIORITY param
+      /*groupOrder*/ GroupOrder::NewestFirst, // non-default, writer emits it
+      /*forward*/ true,                       // default, so no FORWARD param
+      /*locType*/ LocationType::LargestObject,
+      /*start*/ std::nullopt,
+      /*endGroup*/ 0,
+      /*params*/ {});
+
+  auto writeResult = writer_.writeSubscribeRequest(writeBuf, req);
+  ASSERT_TRUE(writeResult.hasValue());
+
+  auto serialized = writeBuf.move();
+  (void)serialized->coalesce();
+  auto len = serialized->length();
+  ASSERT_GT(len, 0u);
+
+  // GROUP_ORDER is the last parameter written for this request (subscription
+  // filter, then group order) and its value is a single-byte varint.
+  auto* data = serialized->writableData();
+  ASSERT_EQ(data[len - 1], folly::to_underlying(GroupOrder::NewestFirst));
+  data[len - 1] = folly::to_underlying(GroupOrder::Default);
+
+  folly::io::Cursor cursor(serialized.get());
+  auto frameType = quic::follyutils::decodeQuicInteger(cursor);
+  EXPECT_EQ(frameType->first, folly::to_underlying(FrameType::SUBSCRIBE));
+
+  auto parseResult = parser_.parseSubscribeRequest(cursor, frameLength(cursor));
+  ASSERT_TRUE(parseResult.hasValue());
+  EXPECT_EQ(parseResult->groupOrder, GroupOrder::Default);
+}
+
 // Test default GroupOrder for SubscribeOk when param not present
 TEST_P(MoQFramerV15PlusTest, SubscribeOkDefaultGroupOrder) {
   folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};

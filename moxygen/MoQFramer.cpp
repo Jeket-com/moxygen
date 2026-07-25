@@ -96,13 +96,12 @@ bool isRequestSpecificParam(moxygen::TrackRequestParamKey key) {
 }
 
 bool isValidGroupOrderParam(uint64_t value) {
-  switch (value) {
-    case folly::to_underlying(moxygen::GroupOrder::OldestFirst):
-    case folly::to_underlying(moxygen::GroupOrder::NewestFirst):
-      return true;
-    default:
-      return false;
-  }
+  // Valid values are Default (0), OldestFirst (1) and NewestFirst (2).
+  // Default is legal on the wire: our own writer omits the parameter rather
+  // than sending 0, but other implementations (e.g. shaka-player) send it
+  // explicitly to mean "use the publisher's order". resolveGroupOrder()
+  // already maps Default onto the publisher's order.
+  return value <= folly::to_underlying(moxygen::GroupOrder::NewestFirst);
 }
 
 bool isValidSubscriberPriorityParam(uint64_t value) {
@@ -821,6 +820,8 @@ MoQFrameParser::parseIntParam(
   p.asUint64 = res->first;
 
   if (!isIntParamValid(version, p.key, p.asUint64)) {
+    XLOG(ERR) << "parseIntParam: invalid value for key=" << key
+              << " value=" << p.asUint64 << " version=" << version;
     return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
   }
 
@@ -828,6 +829,8 @@ MoQFrameParser::parseIntParam(
       getDraftMajorVersion(version) <= 16 &&
       key == folly::to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT) &&
       p.asUint64 == 0) {
+    XLOG(ERR) << "parseIntParam: DELIVERY_TIMEOUT=0 is not allowed in a request"
+              << " for version " << version;
     return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
   }
   return p;
