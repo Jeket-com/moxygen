@@ -475,6 +475,9 @@ class StreamPublisherImpl
 
   std::shared_ptr<MoQSession::PublisherImpl> publisher_{nullptr};
   bool streamComplete_{false};
+  // Why the stream completed. Surfaced in the write-after-complete error so
+  // that occurrence identifies its own cause without extra logging.
+  const char* completionCause_{"unknown"};
   std::optional<folly::CancellationCallback> cancelCallback_;
   proxygen::WebTransport::StreamWriteHandle* writeHandle_{nullptr};
   StreamType streamType_;
@@ -725,6 +728,7 @@ StreamPublisherImpl::writeToStream(bool finStream, bool endObject) {
       writeBuf_.move(), finStream, deliveryCallback);
   if (writeRes.hasValue()) {
     if (finStream) {
+      completionCause_ = "FIN";
       onStreamComplete();
     }
     return folly::unit;
@@ -986,6 +990,9 @@ void StreamPublisherImpl::reset(ResetStreamErrorCode error) {
     // or prior to first fetch write
     XLOG(DBG4) << "reset with no write handle: sgp=" << this;
   }
+  completionCause_ = (error == ResetStreamErrorCode::CANCELLED)
+      ? "reset(CANCELLED)"
+      : "reset(INTERNAL_ERROR)";
   onStreamComplete();
 }
 
@@ -1009,10 +1016,21 @@ StreamPublisherImpl::ensureWriteHandle() {
     return folly::unit;
   }
   if (streamComplete_) {
-    // TODO: return CANCELLED if after stop sending, since that's not an API
-    // error
+    // The stream is gone: FIN'd normally, reset by us, or cancelled by the
+    // peer (STOP_SENDING). None of those are the caller's programming error,
+    // and MoQForwarder::isSoftError treats API_ERROR as fatal to the entire
+    // subscription — one dead subgroup would cost the subscriber every future
+    // group on the track. Report CANCELLED so the forwarder tombstones just
+    // this subgroup and the subscriber survives.
+    //
+    // Genuine API misuse (object ID not advancing, previous object
+    // incomplete) is still reported as API_ERROR by validatePublish at the
+    // point it happens, before the stream is torn down.
     return folly::makeUnexpected(MoQPublishError(
-        MoQPublishError::API_ERROR, "Write after stream complete or reset"));
+        MoQPublishError::CANCELLED,
+        fmt::format(
+            "Write after stream complete or reset (completed via {})",
+            completionCause_)));
   }
   XCHECK(publisher_) << "publisher_ has not been set";
   // This has to be FETCH, subscribe is created with a writeHandle_ and

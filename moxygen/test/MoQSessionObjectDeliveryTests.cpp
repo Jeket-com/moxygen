@@ -282,6 +282,61 @@ CO_TEST_P_X(MoQSessionTest, MixSubgroupsAndDatagrams) {
   co_await publishDone_;
   serverSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
+// Writing to a subgroup after its stream has completed must report CANCELLED,
+// not API_ERROR.
+//
+// MoQForwarder::isSoftError treats CANCELLED as per-subgroup (tombstone the
+// subgroup, keep the subscriber) and API_ERROR as fatal to the whole
+// subscription. Reporting a finished stream as API_ERROR cost a relay
+// subscriber every future group on the track, which showed up as video dying
+// a second after SUBSCRIBE_OK while audio kept flowing (JSS#607). Genuine API
+// misuse is still reported as API_ERROR by validatePublish before the stream
+// is torn down, so nothing is masked here.
+CO_TEST_P_X(MoQSessionTest, WriteAfterSubgroupCompleteIsCancelled) {
+  co_await setupMoQSession();
+  expectSubscribe(
+      [this](auto sub, auto pub) -> TaskSubscribeResult {
+        eventBase_.add([pub, sub] {
+          auto sgp = pub->beginSubgroup(0, 0, 0).value();
+          // FIN the subgroup.
+          sgp->object(0, moxygen::test::makeBuf(10), noExtensions(), true);
+
+          // The stream is now complete. A further write must not be an
+          // API_ERROR.
+          auto afterFin = sgp->object(1, moxygen::test::makeBuf(10));
+          EXPECT_TRUE(afterFin.hasError());
+          EXPECT_EQ(afterFin.error().code, MoQPublishError::CANCELLED);
+          // The cause is carried in the message so a live occurrence
+          // identifies itself without extra logging.
+          EXPECT_NE(
+              std::string(afterFin.error().what()).find("FIN"),
+              std::string::npos);
+
+          auto beginAfterFin =
+              sgp->beginObject(2, 10, moxygen::test::makeBuf(10));
+          EXPECT_TRUE(beginAfterFin.hasError());
+          EXPECT_EQ(beginAfterFin.error().code, MoQPublishError::CANCELLED);
+
+          pub->publishDone(getTrackEndedPublishDone(sub.requestID));
+        });
+        co_return makeSubscribeOkResult(sub);
+      },
+      MoQControlCodec::Direction::CLIENT);
+
+  auto sg = std::make_shared<testing::StrictMock<MockSubgroupConsumer>>();
+  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, 0, _))
+      .WillOnce(testing::Return(sg));
+  // Only the pre-FIN object reaches the consumer.
+  EXPECT_CALL(*sg, object(0, _, _, true))
+      .WillOnce(testing::Return(folly::unit));
+
+  expectPublishDone(MoQControlCodec::Direction::SERVER);
+  auto res = co_await serverSession_->subscribe(
+      getSubscribe(kTestTrackName), subscribeCallback_);
+  co_await publishDone_;
+  serverSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
 CO_TEST_P_X(MoQSessionTest, DatagramBeforeSessionSetup) {
   clientSession_->start();
   EXPECT_FALSE(clientWt_->isSessionClosed());
