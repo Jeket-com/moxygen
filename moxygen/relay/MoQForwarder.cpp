@@ -20,9 +20,17 @@ bool isSoftError(const MoQPublishError& err) {
     case MoQPublishError::CANCELLED: // STOP_SENDING, stream reset, delivery
                                      // timeout
       return true;
+    case MoQPublishError::BLOCKED:
+      // Out of unidirectional stream credit for this peer. Transient flow
+      // control, not a subscription failure: the peer will grant more credit
+      // via MAX_STREAMS. Dropping the subscriber here costs it every future
+      // group on the track, which is far worse than skipping one subgroup —
+      // and it is reachable for subscribe whenever a publisher opens subgroup
+      // streams faster than the peer retires them (a browser subscribed to
+      // several video tiers at once will do exactly that).
+      return true;
     case MoQPublishError::API_ERROR:       // Programming error
     case MoQPublishError::WRITE_ERROR:     // Transport broken
-    case MoQPublishError::BLOCKED:         // Shouldn't happen for subscribe
     case MoQPublishError::TOO_FAR_BEHIND:  // Will result in unsubscribe anyway
     case MoQPublishError::MALFORMED_TRACK: // Protocol violation
     default:

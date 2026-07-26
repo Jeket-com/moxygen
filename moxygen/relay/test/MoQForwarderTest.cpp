@@ -575,6 +575,77 @@ TEST_F(MoQForwarderTest, SubscribeUpdateStartLocationCanDecrease) {
       << "Start location should be updated to {5, 0}";
 }
 
+// Test: BLOCKED (out of unidirectional stream credit) is a soft error. It
+// tombstones the one subgroup and leaves the subscription alive, so the next
+// group still gets delivered.
+//
+// Running out of stream credit is transient flow control — the peer grants
+// more via MAX_STREAMS. Treating it as fatal cost a subscriber every future
+// group on the track; observed against a browser subscribed to several video
+// tiers at once, where the relay opened subgroup streams faster than the peer
+// retired them (JSS#607).
+TEST_F(MoQForwarderTest, SubgroupTombstonedAfterBlockedError) {
+  auto subscriber = createMockSession();
+
+  auto forwarder = std::make_shared<MoQForwarder>(kFwdTestTrackName);
+  auto consumer = createMockConsumer();
+  std::shared_ptr<MockSubgroupConsumer> sg;
+
+  EXPECT_CALL(*consumer, beginSubgroup(0, 0, _, _))
+      .WillOnce([this, &sg](
+                    uint64_t,
+                    uint64_t,
+                    uint8_t,
+                    moxygen::TrackConsumer::BeginSubgroupOptions) {
+        sg = createMockSubgroupConsumer();
+        EXPECT_CALL(*sg, object(0, _, _, false)).WillOnce(Return(folly::unit));
+        EXPECT_CALL(*sg, object(1, _, _, false))
+            .WillOnce(Return(
+                folly::makeUnexpected(MoQPublishError(
+                    MoQPublishError::BLOCKED, "Failed to create uni stream."))));
+        return folly::
+            makeExpected<MoQPublishError, std::shared_ptr<SubgroupConsumer>>(
+                sg);
+      });
+
+  // The subscription must survive: the next group still opens a subgroup.
+  std::shared_ptr<MockSubgroupConsumer> sg2;
+  EXPECT_CALL(*consumer, beginSubgroup(1, 0, _, _))
+      .WillOnce([this, &sg2](
+                    uint64_t,
+                    uint64_t,
+                    uint8_t,
+                    moxygen::TrackConsumer::BeginSubgroupOptions) {
+        sg2 = createMockSubgroupConsumer();
+        EXPECT_CALL(*sg2, object(0, _, _, false)).WillOnce(Return(folly::unit));
+        EXPECT_CALL(*sg2, endOfSubgroup()).WillOnce(Return(folly::unit));
+        return folly::
+            makeExpected<MoQPublishError, std::shared_ptr<SubgroupConsumer>>(
+                sg2);
+      });
+
+  auto subHandle =
+      addSubscriber(*forwarder, subscriber, consumer, RequestID(1));
+  ASSERT_NE(subHandle, nullptr);
+
+  auto subgroup1Res = forwarder->beginSubgroup(0, 0, 0);
+  ASSERT_TRUE(subgroup1Res.hasValue());
+  auto subgroup1 = *subgroup1Res;
+
+  EXPECT_TRUE(subgroup1->object(0, test::makeBuf(10)).hasValue());
+  // This one hits BLOCKED and tombstones subgroup {0,0} for this subscriber.
+  EXPECT_TRUE(subgroup1->object(1, test::makeBuf(10)).hasValue());
+
+  // Subscriber still receives the next group.
+  auto subgroup2Res = forwarder->beginSubgroup(1, 0, 0);
+  ASSERT_TRUE(subgroup2Res.hasValue());
+  auto subgroup2 = *subgroup2Res;
+  EXPECT_TRUE(subgroup2->object(0, test::makeBuf(10)).hasValue());
+
+  EXPECT_TRUE(subgroup2->endOfSubgroup().hasValue());
+  EXPECT_TRUE(subgroup1->endOfSubgroup().hasValue());
+}
+
 // Test: Subgroup is tombstoned after CANCELLED error (soft error), keeping the
 // subscription alive for subsequent subgroups.
 TEST_F(MoQForwarderTest, SubgroupTombstonedAfterCancelledError) {
