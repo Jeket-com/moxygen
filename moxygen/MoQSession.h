@@ -415,7 +415,30 @@ class MoQSession : public Subscriber,
       if (bytesBufferedThreshold_ == 0) {
         return true;
       }
-      return (bytesBuffered_ + numBytes <= bytesBufferedThreshold_);
+      const bool ok = (bytesBuffered_ + numBytes <= bytesBufferedThreshold_);
+      if (!ok) {
+        // Diagnostic for the TOO_FAR_BEHIND path. bytesBuffered_ tracks bytes
+        // WRITTEN-BUT-NOT-YET-ACKED: onBytesBuffered() adds on every write and
+        // only onByteEventCommon() -> onBytesUnbuffered() subtracts, on a QUIC
+        // delivery/cancel byte event. If those byte events do not fire, this
+        // counter climbs monotonically and evicts a subscriber that is not
+        // actually behind — indistinguishable, from the outside, from genuine
+        // backpressure.
+        //
+        // Printing the operands separates the two: compare bytesBuffered_ here
+        // against the process RSS. On JBS#1923 the relay evicted subscribers
+        // while holding only 3Mi RSS against a 64Mi threshold, which cannot be
+        // real buffering — but with no counter exposed anywhere (the relay's
+        // /metrics reports only the configured cap) that could not be
+        // demonstrated, only inferred.
+        XLOG(ERR) << "canBufferBytes REJECT: buffered=" << bytesBuffered_
+                  << " requested=" << numBytes
+                  << " threshold=" << bytesBufferedThreshold_
+                  << " bufferCalls=" << bufferCalls_
+                  << " unbufferCalls=" << unbufferCalls_
+                  << " bytesUnbuffered=" << bytesUnbufferedTotal_;
+      }
+      return ok;
     }
 
     void fetchComplete();
@@ -433,10 +456,17 @@ class MoQSession : public Subscriber,
 
     void onBytesBuffered(uint64_t amount) {
       bytesBuffered_ += amount;
+      bufferCalls_++;
     }
 
     void onBytesUnbuffered(uint64_t amount) {
       bytesBuffered_ -= amount;
+      // Counted so canBufferBytes() can report whether the ACK path ever ran.
+      // unbufferCalls_ == 0 alongside a REJECT is the whole diagnosis: bytes
+      // are being added on write and never subtracted, so the threshold is
+      // reached by write volume rather than by a subscriber falling behind.
+      unbufferCalls_++;
+      bytesUnbufferedTotal_ += amount;
     }
 
     const MoQSettings* getMoqSettings() const {
@@ -484,6 +514,12 @@ class MoQSession : public Subscriber,
     uint64_t version_;
     uint64_t bytesBuffered_{0};
     uint64_t bytesBufferedThreshold_{0};
+    // Diagnostic counters for the TOO_FAR_BEHIND path (see canBufferBytes).
+    // Reported only when a write is rejected, so they cost two increments on
+    // the hot path and produce no output in normal operation.
+    uint64_t bufferCalls_{0};
+    uint64_t unbufferCalls_{0};
+    uint64_t bytesUnbufferedTotal_{0};
     std::optional<uint8_t> publisherPriority_;
     std::shared_ptr<ReplyContext> replyContext_;
     std::shared_ptr<BidiStreamControl> bidiControl_;
