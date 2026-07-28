@@ -415,14 +415,50 @@ class StreamPublisherImpl
   void onByteEventCommon(quic::StreamId id, uint64_t offset) {
     uint64_t bytesDeliveredOrCanceled = offset + 1;
     if (bytesDeliveredOrCanceled > bytesDeliveredOrCanceled_) {
-      publisher_->onBytesUnbuffered(
-          bytesDeliveredOrCanceled - bytesDeliveredOrCanceled_);
+      // Release only what THIS stream actually contributed to the
+      // per-subscriber total. The delta is derived from a QUIC stream offset,
+      // but bytesBuffered_ is a per-subscriber (per-session) counter fed by
+      // onBytesBuffered(writeBuf_.chainLength()). Those two are not guaranteed
+      // to agree: an offset can advance past what this stream accounted for,
+      // and subtracting the raw delta then drives the subscriber counter
+      // NEGATIVE. It is unsigned, so it wraps to ~1.8e19 and canBufferBytes()
+      // rejects every subsequent write — permanently evicting every subscriber
+      // on the session for the life of the process.
+      //
+      // Observed on JBS#1923: "buffered=18446744073709551611 requested=4
+      // threshold=16777216" — a 4-byte write refused against a 16Mi cap, with
+      // bufferCalls == unbufferCalls (405/405) but bytesUnbuffered exceeding
+      // everything ever added. Preview tiles froze ~2s after subscribing, for
+      // weeks, with the relay holding 3Mi RSS.
+      const uint64_t delta = bytesDeliveredOrCanceled - bytesDeliveredOrCanceled_;
+      const uint64_t release = std::min(delta, bytesAccountedToSession_);
+      if (release < delta) {
+        XLOG(WARN) << "byte event exceeds accounted bytes: delta=" << delta
+                   << " accounted=" << bytesAccountedToSession_
+                   << " streamId=" << id << " — clamping";
+      }
+      if (release > 0) {
+        publisher_->onBytesUnbuffered(release);
+        bytesAccountedToSession_ -= release;
+      }
       bytesDeliveredOrCanceled_ = bytesDeliveredOrCanceled;
     }
 
     refCountForCallbacks_--;
     if (refCountForCallbacks_ == 0) {
       keepaliveForDeliveryCallbacks_.reset();
+    }
+  }
+
+  // Hand back any bytes this stream still owns in the per-subscriber total.
+  // Without this a stream that is reset mid-flight (or finishes without a byte
+  // event for its tail) leaks its outstanding bytes into bytesBuffered_
+  // forever, so a subscriber that churns streams slowly starves itself — the
+  // mirror image of the underflow above.
+  void releaseAccountedBytes() {
+    if (bytesAccountedToSession_ > 0 && publisher_) {
+      publisher_->onBytesUnbuffered(bytesAccountedToSession_);
+      bytesAccountedToSession_ = 0;
     }
   }
 
@@ -490,8 +526,17 @@ class StreamPublisherImpl
   std::shared_ptr<StreamPublisherImpl> keepaliveForDeliveryCallbacks_{nullptr};
   uint32_t refCountForCallbacks_{0};
 
-  uint32_t bytesWritten_{0};
-  uint32_t bytesDeliveredOrCanceled_{0};
+  // 64-bit: both are compared against and assigned from uint64_t QUIC stream
+  // offsets. As uint32_t an offset past 4GiB truncated on assignment, so the
+  // next delta was computed against a wrapped value and over-released into the
+  // per-subscriber counter.
+  uint64_t bytesWritten_{0};
+  uint64_t bytesDeliveredOrCanceled_{0};
+
+  // Bytes this stream has added to the per-subscriber bytesBuffered_ and not
+  // yet released. Bounds what onByteEventCommon may subtract, so a stream can
+  // never release more than it contributed.
+  uint64_t bytesAccountedToSession_{0};
 
   bool forward_{true};
 };
@@ -634,6 +679,10 @@ void StreamPublisherImpl::setWriteHandle(
 void StreamPublisherImpl::onStreamComplete() {
   XCHECK_EQ(writeHandle_, nullptr);
   streamComplete_ = true;
+  // Reached on FIN and on reset(). Anything this stream still owns in the
+  // per-subscriber total will never see a byte event, so release it here or it
+  // leaks for the life of the session.
+  releaseAccountedBytes();
 
   if (publisher_) {
     publisher_->onStreamComplete(header_);
@@ -719,6 +768,9 @@ StreamPublisherImpl::writeToStream(bool finStream, bool endObject) {
 
     bytesWritten_ += writeBuf_.chainLength();
     publisher_->onBytesBuffered(writeBuf_.chainLength());
+    // Mirror it per-stream so onByteEventCommon can only release what this
+    // stream actually put into the per-subscriber total.
+    bytesAccountedToSession_ += writeBuf_.chainLength();
     if (refCountForCallbacks_ == 0) {
       keepaliveForDeliveryCallbacks_ = shared_from_this();
     }
