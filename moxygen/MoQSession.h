@@ -460,11 +460,25 @@ class MoQSession : public Subscriber,
     }
 
     void onBytesUnbuffered(uint64_t amount) {
+      // Saturate at zero. bytesBuffered_ is unsigned, so an over-release wraps
+      // it to ~1.8e19 and canBufferBytes() then refuses EVERY subsequent write
+      // — a 4-byte write against a 16Mi cap — permanently evicting every
+      // subscriber on the session for the life of the process. That is not a
+      // recoverable state and it is silent: nothing here logs, and RSS stays
+      // flat because no bytes were ever really held (JBS#1923, weeks of dead
+      // preview tiles).
+      //
+      // Callers are expected to release only what they accounted for
+      // (StreamPublisherImpl::bytesAccountedToSession_ enforces that per
+      // stream). This clamp is the backstop, so a future accounting slip
+      // degrades to a warning instead of bricking the session.
+      if (amount > bytesBuffered_) {
+        XLOG(WARN) << "onBytesUnbuffered over-release: amount=" << amount
+                   << " buffered=" << bytesBuffered_ << " — clamping to zero";
+        amount = bytesBuffered_;
+      }
       bytesBuffered_ -= amount;
       // Counted so canBufferBytes() can report whether the ACK path ever ran.
-      // unbufferCalls_ == 0 alongside a REJECT is the whole diagnosis: bytes
-      // are being added on write and never subtracted, so the threshold is
-      // reached by write volume rather than by a subscriber falling behind.
       unbufferCalls_++;
       bytesUnbufferedTotal_ += amount;
     }
