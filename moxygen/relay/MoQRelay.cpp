@@ -501,8 +501,26 @@ Subscriber::PublishResult MoQRelay::publish(
          0, // filled in by session
          "upstream disconnect"});
   }
-  auto res = nodePtr->publishes.emplace(pub.fullTrackName.trackName, session);
-  XCHECK(res.second) << "Duplicate publish";
+  // Replace rather than XCHECK. subscriptions_ and nodePtr->publishes are
+  // separate registries and can legitimately diverge: the cleanup above only
+  // runs when subscriptions_ still holds the track, but several paths erase a
+  // subscription without touching publishes (notably onEmpty's
+  // publisher-terminated branch). A publisher that disconnects and reconnects
+  // — every redeploy, restart or network blip — then arrives here with a stale
+  // entry still present.
+  //
+  // Aborting the process over that takes down every track and every subscriber
+  // on the relay, and leaves consumers that do not re-subscribe silently dead
+  // (JSS#625). Replacing the stale registration is both survivable and
+  // correct: the new session is the live publisher.
+  auto [pubIt, inserted] =
+      nodePtr->publishes.insert_or_assign(pub.fullTrackName.trackName, session);
+  (void)pubIt;
+  if (!inserted) {
+    XLOG(WARN) << "Replacing stale publish registration for track="
+               << pub.fullTrackName.trackName
+               << " ns=" << pub.fullTrackName.trackNamespace;
+  }
 
   // If this is the first content added to this node, notify parent
   if (wasEmpty && nodePtr->hasLocalSessions() && nodePtr->parent_) {
@@ -1924,6 +1942,23 @@ void MoQRelay::onEmpty(MoQForwarder* forwarder) {
   if (!subscription.handle) {
     // Handle is null - publisher terminated via FilterConsumer
     XLOG(INFO) << "Publisher terminated for " << subscriptionIt->first;
+    // Drop the publish registration too. Leaving it behind desynchronises
+    // nodePtr->publishes from subscriptions_, and the next PUBLISH for this
+    // track from a reconnecting publisher then collides with the stale entry
+    // (JSS#625). Mirrors the cleanup in onPublishDoneImpl.
+    if (subscription.isPublish) {
+      const auto& ftn = subscriptionIt->first;
+      auto nodePtr = findNamespaceNode(ftn.trackNamespace);
+      if (nodePtr) {
+        bool hadLocalContent = nodePtr->hasLocalSessions();
+        nodePtr->publishes.erase(ftn.trackName);
+        if (hadLocalContent && !nodePtr->shouldKeep() && nodePtr->parent_ &&
+            !ftn.trackNamespace.trackNamespace.empty()) {
+          nodePtr->parent_->tryPruneChild(
+              ftn.trackNamespace.trackNamespace.back());
+        }
+      }
+    }
     subscriptions_.erase(subscriptionIt);
     return;
   }

@@ -536,6 +536,45 @@ TEST_F(MoQRelayTest, PublishSuccess) {
   removeSession(publisherSession);
 }
 
+// Test: a publisher that goes away and comes back must not abort the relay.
+//
+// nodePtr->publishes and subscriptions_ are separate registries. publish()
+// only cleans up publishes when subscriptions_ still holds the track, so any
+// path that erases a subscription without touching publishes leaves a stale
+// entry behind. publish() used to XCHECK on that collision, which aborted the
+// whole process — taking down every track and every subscriber, and leaving
+// consumers that do not re-subscribe silently dead (JSS#625). It is now a
+// replace-with-warning.
+//
+// This is the ordinary reconnect sequence: every publisher redeploy, restart
+// or network blip.
+TEST_F(MoQRelayTest, RepublishAfterPublisherWentAwayDoesNotAbort) {
+  auto firstPublisher = createMockSession();
+  auto secondPublisher = createMockSession();
+
+  doPublishNamespace(firstPublisher, kTestNamespace);
+  doPublish(firstPublisher, kTestTrackName);
+
+  auto state = relay_->findPublishState(kTestTrackName);
+  EXPECT_TRUE(state.nodeExists);
+  EXPECT_EQ(state.session, firstPublisher);
+
+  // Publisher goes away.
+  removeSession(firstPublisher);
+
+  // It comes back as a new session and republishes the same track. This must
+  // not abort, and the live publisher must be the new session.
+  doPublishNamespace(secondPublisher, kTestNamespace);
+  doPublish(secondPublisher, kTestTrackName);
+
+  state = relay_->findPublishState(kTestTrackName);
+  EXPECT_TRUE(state.nodeExists);
+  EXPECT_EQ(state.session, secondPublisher)
+      << "republish must hand ownership to the reconnecting publisher";
+
+  removeSession(secondPublisher);
+}
+
 // Test: Tree pruning when leaf node is removed
 // Scenario: test/A/B/C and test/A/D exist. Remove C should prune B but keep A
 // and D
