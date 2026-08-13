@@ -103,6 +103,23 @@ struct TestNGRCallback : public MoQForwarder::Callback {
   std::vector<uint64_t> calls;
 };
 
+// Records the ORDER of the lifetime callbacks. An owning registry (MoQRelay)
+// relies on onPublishDone firing, and firing before the subscribers are
+// drained, to release a forwarder whose source has terminated.
+struct LifecycleRecordingCallback : public MoQForwarder::Callback {
+  void onEmpty(MoQForwarder*) override {
+    events.push_back("onEmpty");
+  }
+  void onPublishDone(MoQForwarder* fwd) override {
+    events.push_back("onPublishDone");
+    publishDoneArg = fwd;
+    ++publishDoneCount;
+  }
+  std::vector<std::string> events;
+  MoQForwarder* publishDoneArg{nullptr};
+  int publishDoneCount{0};
+};
+
 auto makeNGRParams(uint64_t val) {
   RequestUpdate upd;
   upd.params.insertParam(Parameter(
@@ -402,6 +419,45 @@ TEST_F(MoQForwarderTest, SubscriberUnsubscribeDoesNotReceiveNewObjects) {
 
   EXPECT_TRUE(subgroup->beginObject(0, 4, 0).hasValue());
   subgroup->reset(ResetStreamErrorCode::SESSION_CLOSED);
+}
+
+// Test: publishDone notifies the owning registry via onPublishDone, and does so
+// BEFORE draining subscribers.
+//
+// This is the contract MoQRelay depends on to release a terminated forwarder.
+// `draining_` is never cleared, so a draining forwarder left in the relay's
+// subscriptions_ map rejects every subsequent SUBSCRIBE for that track
+// permanently — observed on jbs-prod as 747 consecutive rejections over 1h44m,
+// clearable only by restarting the relay (JBS#2201).
+TEST_F(MoQForwarderTest, PublishDoneNotifiesRegistryBeforeDrainingSubscribers) {
+  auto session = createMockSession();
+  auto consumer = createMockConsumer();
+  auto forwarder = std::make_shared<MoQForwarder>(kFwdTestTrackName);
+  auto callback = std::make_shared<LifecycleRecordingCallback>();
+  forwarder->setCallback(callback);
+
+  auto handle = addSubscriber(*forwarder, session, consumer, RequestID(1));
+  ASSERT_NE(handle, nullptr);
+
+  EXPECT_CALL(*consumer, publishDone(testing::_));
+  EXPECT_TRUE(forwarder
+                  ->publishDone(
+                      {RequestID(1),
+                       PublishDoneStatusCode::TRACK_ENDED,
+                       0,
+                       "track ended"})
+                  .hasValue());
+
+  // Fired exactly once, with the terminating forwarder's identity so an owning
+  // registry can distinguish it from a replacement forwarder for the same
+  // track (a reconnecting publisher).
+  EXPECT_EQ(callback->publishDoneCount, 1);
+  EXPECT_EQ(callback->publishDoneArg, forwarder.get());
+
+  // Ordering matters: the registry is told the source is gone before the
+  // subscriber drain can drive the forwarder empty.
+  ASSERT_FALSE(callback->events.empty());
+  EXPECT_EQ(callback->events.front(), "onPublishDone");
 }
 
 // Test: Data operations return CANCELLED when all subscribers fail and are

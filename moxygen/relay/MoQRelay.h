@@ -310,6 +310,7 @@ class MoQRelay : public Publisher,
       std::shared_ptr<MoQSession> upstreamSession);
 
   void onEmpty(MoQForwarder* forwarder) override;
+  void onPublishDone(MoQForwarder* forwarder) override;
   void forwardChanged(MoQForwarder* forwarder) override;
   void newGroupRequested(MoQForwarder* forwarder, uint64_t group) override;
 

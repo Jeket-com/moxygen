@@ -1932,6 +1932,38 @@ folly::coro::Task<Publisher::TrackStatusResult> MoQRelay::trackStatus(
   }
 }
 
+void MoQRelay::onPublishDone(MoQForwarder* forwarder) {
+  // MoQForwarder::publishDone() has just set draining_ = true and is about to
+  // drain its subscribers. draining_ is NEVER cleared, so a draining forwarder
+  // left in subscriptions_ is poisoned permanently: every later SUBSCRIBE for
+  // that track resolves to it and addSubscriber() returns null, which the
+  // relay reports as SUBSCRIBE_ERROR forever.
+  //
+  // Without this override the base-class no-op left subscription.handle set,
+  // so when the last subscriber departed onEmpty() took its "just last
+  // subscriber left" branch and KEPT the dead subscription. Observed on
+  // jbs-prod as 747 consecutive rejections over 1h44m for one preview track,
+  // clearable only by restarting the relay (JBS#2201).
+  //
+  // Routing to onPublishDoneImpl() clears handle/upstream, so onEmpty() takes
+  // the "publisher terminated" branch and erases the entry, letting the next
+  // PUBLISH/ANNOUNCE build a fresh forwarder.
+  auto subscriptionIt = subscriptions_.find(forwarder->fullTrackName());
+  if (subscriptionIt == subscriptions_.end()) {
+    return;
+  }
+  // Identity-scoped via the pointer: a reconnecting publisher may already have
+  // replaced this entry with a NEW forwarder for the same track name. Tearing
+  // that one down here would strip a live subscription (cf. JSS#625, where a
+  // duplicate publish from a reconnecting publisher aliases the same FTN).
+  if (subscriptionIt->second.forwarder.get() != forwarder) {
+    XLOG(DBG1) << "Ignoring publishDone from a superseded forwarder for "
+               << subscriptionIt->first;
+    return;
+  }
+  onPublishDoneImpl(forwarder->fullTrackName());
+}
+
 void MoQRelay::onEmpty(MoQForwarder* forwarder) {
   auto subscriptionIt = subscriptions_.find(forwarder->fullTrackName());
   if (subscriptionIt == subscriptions_.end()) {
