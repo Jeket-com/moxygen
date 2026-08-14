@@ -67,6 +67,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /moxygen
 COPY . /moxygen
 
+# Pull GNU tarballs from the canonical origin, not the redirector.
+#
+# getdeps' vendored manifests (autoconf, automake, libtool, gperf, ncurses,
+# libiberty, libiberty-python) fetch from ftpmirror.gnu.org, a round-robin
+# redirector that returns HTTP 502 under load. It took down the v0.3.0-rc6
+# release build twice in a row — first on gperf-3.3, then on libtool-2.4.6 —
+# and it is not retry-able: getdeps exhausts its own retries and gives up with
+# TransientFailure, failing the build ~20 minutes in.
+#
+# ftp.gnu.org is the canonical origin and serves byte-identical tarballs.
+# getdeps still verifies the sha256 recorded in each manifest, so this changes
+# only WHERE the bytes come from, never WHETHER they are checked.
+#
+# Rewriting here rather than editing the manifests keeps those files pristine
+# for upstream fbcode_builder syncs.
+RUN sed -i 's|https://ftpmirror\.gnu\.org/|https://ftp.gnu.org/|g' \
+        build/fbcode_builder/manifests/* && \
+    ! grep -rq 'ftpmirror\.gnu\.org' build/fbcode_builder/manifests/
+
 # Build moxygen + transitive Meta dependencies. The arg list mirrors
 # JBS/docker/Dockerfile.publisher-base lines 65-73 (the proven config):
 #   --num-jobs 8       Folly link steps need ~1-2 GiB each. 8 fits in the
