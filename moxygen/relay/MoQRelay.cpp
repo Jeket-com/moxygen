@@ -1425,8 +1425,31 @@ folly::coro::Task<Publisher::SubscribeResult> MoQRelay::subscribe(
 
   auto subscriptionIt = subscriptions_.find(subReq.fullTrackName);
   if (subscriptionIt != subscriptions_.end()) {
-    co_return co_await subscribeToExistingRelaySubscription(
-        std::move(subReq), std::move(consumer), std::move(session));
+    // A forwarder that has begun draining refuses every addSubscriber() for
+    // the rest of its life, and nothing removes the subscription that owns it.
+    // So once an upstream publisher goes away — a restart, a dropped session —
+    // the entry outlives it, and every later SUBSCRIBE for that track resolves
+    // to the corpse and fails with INTERNAL_ERROR. Permanently: the publisher
+    // coming back and re-announcing does not replace it, because this lookup
+    // finds the draining entry first and never reaches the upstream path.
+    //
+    // Observed as every preview tile dead after the publisher pod restarted,
+    // recovering only when the relay itself was restarted, with
+    // "addSubscriber returned null (draining?)" once per retry, forever.
+    //
+    // Evicting here is safe: subscribeToFirstRelaySubscription re-establishes
+    // upstream, and a concurrent waiter that had captured this iterator already
+    // handles disappearance ("subscription is gone") after awaiting the
+    // promise.
+    if (subscriptionIt->second.forwarder &&
+        subscriptionIt->second.forwarder->draining()) {
+      XLOG(INFO) << "evicting draining subscription for "
+                 << subReq.fullTrackName << "; re-subscribing upstream";
+      subscriptions_.erase(subscriptionIt);
+    } else {
+      co_return co_await subscribeToExistingRelaySubscription(
+          std::move(subReq), std::move(consumer), std::move(session));
+    }
   }
 
   auto upstreamSession =
