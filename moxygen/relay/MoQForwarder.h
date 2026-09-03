@@ -166,6 +166,13 @@ class MoQForwarder : public TrackConsumer {
     return subscribers_.empty();
   }
 
+  // A draining forwarder refuses every addSubscriber() for the rest of its
+  // life. Callers that hold a forwarder across a publisher going away need to
+  // be able to ask, rather than discovering it from a null return.
+  [[nodiscard]] bool draining() const {
+    return draining_;
+  }
+
   std::shared_ptr<MoQForwarder::Subscriber> addSubscriber(
       std::shared_ptr<MoQSession> session,
       const SubscribeRequest& subReq,
