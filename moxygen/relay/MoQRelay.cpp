@@ -389,6 +389,18 @@ void MoQRelay::publishNamespaceDone(
   }
 }
 
+MoQRelay::SubscriptionState MoQRelay::findSubscriptionState(
+    const FullTrackName& ftn) {
+  SubscriptionState state;
+  auto it = subscriptions_.find(ftn);
+  if (it == subscriptions_.end()) {
+    return state;
+  }
+  state.exists = true;
+  state.draining = it->second.forwarder && it->second.forwarder->draining();
+  return state;
+}
+
 void MoQRelay::onPublishDoneImpl(const FullTrackName& ftn) {
   XLOG(DBG1) << __func__ << " ftn=" << ftn;
 

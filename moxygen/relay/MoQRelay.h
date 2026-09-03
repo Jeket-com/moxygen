@@ -110,6 +110,17 @@ class MoQRelay : public Publisher,
   };
   PublishState findPublishState(const FullTrackName& ftn);
 
+  // Test accessor: does a relay subscription exist for this track, and is its
+  // forwarder draining? A test for the draining-eviction path cannot be
+  // trusted without this — if the subscription had already been collected, a
+  // later SUBSCRIBE succeeds for the wrong reason and the test passes whether
+  // or not the eviction works.
+  struct SubscriptionState {
+    bool exists{false};   // an entry is present in subscriptions_
+    bool draining{false}; // ...and its forwarder refuses new subscribers
+  };
+  SubscriptionState findSubscriptionState(const FullTrackName& ftn);
+
  private:
   class NamespaceSubscription;
   class TracksSubscription;
