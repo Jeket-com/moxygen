@@ -1403,6 +1403,11 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
       override {
     resetAllSubgroups(code);
     auto session = std::exchange(session_, nullptr);
+    if (!session) {
+      // The session is gone: there is nobody to send the reply to.
+      subscriptionHandle_.reset();
+      return;
+    }
     if (!subscriptionHandle_) {
       XCHECK(replyContext_);
       session->subscribeError(
@@ -1466,7 +1471,7 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
       std::optional<std::chrono::milliseconds> newTimeout);
 
   std::chrono::microseconds getCurrentRtt() const {
-    return session_->getTransportInfo().srtt;
+    return getTransportInfo().srtt;
   }
 
   std::shared_ptr<MLogger> logger_ = nullptr;
@@ -1727,6 +1732,11 @@ void MoQSession::TrackPublisherImpl::onTooManyBytesBuffered() {
   // we're ensured that the stream counts are consistent. We can also add in
   // a timeout for the stream count discrepancy so that the peer doesn't
   // hang indefinitely waiting for the stream counts to equalize.
+  if (!session_) {
+    // The session is gone: only the streams are left to give up on.
+    resetAllSubgroups(ResetStreamErrorCode::TOO_FAR_BEHIND);
+    return;
+  }
   terminatePublish(
       PublishDone(
           {requestID_,
@@ -2358,6 +2368,12 @@ MoQSession::MoQSession(
 
 MoQSession::~MoQSession() {
   cleanup();
+  // cleanup() reaches only the publishers still in pubTracks_. Clear session_
+  // on the rest (see attachedPublishers_), so a byte event that arrives after
+  // this finds no session instead of a destroyed one.
+  while (!attachedPublishers_.empty()) {
+    attachedPublishers_.front().setSession(nullptr);
+  }
   if (logger_) {
     logger_->outputLogs();
   }
@@ -5933,7 +5949,9 @@ void MoQSession::sendMaxRequestID(bool signalWriteLoop) {
 }
 
 void MoQSession::PublisherImpl::fetchComplete() {
-  std::exchange(session_, nullptr)->fetchComplete(requestID_);
+  if (auto* session = std::exchange(session_, nullptr)) {
+    session->fetchComplete(requestID_);
+  }
 }
 
 void MoQSession::fetchComplete(RequestID requestID) {

@@ -12,6 +12,7 @@
 #include <moxygen/events/MoQExecutor.h>
 #include <chrono>
 
+#include <folly/IntrusiveList.h>
 #include <folly/MaybeManagedPtr.h>
 #include <folly/container/F14Map.h>
 #include <folly/coro/Promise.h>
@@ -365,6 +366,9 @@ class MoQSession : public Subscriber,
           version_(version),
           bytesBufferedThreshold_(bytesBufferedThreshold) {
       moqFrameWriter_.initializeVersion(version);
+      if (session_) {
+        session_->attachedPublishers_.push_back(*this);
+      }
     }
 
     virtual ~PublisherImpl() = default;
@@ -398,7 +402,11 @@ class MoQSession : public Subscriber,
     }
 
     void setSession(MoQSession* session) {
+      sessionLink_.unlink();
       session_ = session;
+      if (session_) {
+        session_->attachedPublishers_.push_back(*this);
+      }
     }
 
     virtual void terminatePublish(
@@ -518,7 +526,12 @@ class MoQSession : public Subscriber,
       return bidiControl_;
     }
 
+    // Links this publisher into its session's attachedPublishers_, and unlinks
+    // it when the publisher is destroyed. Public so the session can name it.
+    folly::IntrusiveListHook sessionLink_;
+
    protected:
+    // Not owning, and not tied to pubTracks_: see attachedPublishers_.
     MoQSession* session_{nullptr};
     FullTrackName fullTrackName_;
     RequestID requestID_;
@@ -1236,6 +1249,14 @@ class MoQSession : public Subscriber,
   // Private session state
   folly::F14FastMap<RequestID, std::shared_ptr<PublisherImpl>, RequestID::hash>
       pubTracks_;
+  // Every PublisherImpl whose session_ points at this session. pubTracks_ is
+  // not that set. A publisher leaves pubTracks_ on UNSUBSCRIBE or PUBLISH_DONE,
+  // but a subgroup stream that was FIN'd holds it until the transport
+  // acknowledges or cancels the stream's last bytes, and that byte event can
+  // arrive after this session is destroyed. The destructor clears session_ on
+  // whatever is still listed here.
+  folly::IntrusiveList<PublisherImpl, &PublisherImpl::sessionLink_>
+      attachedPublishers_;
   folly::F14FastSet<FullTrackName, FullTrackName::hash> pendingPublishTracks_;
   folly::F14FastSet<FullTrackName, FullTrackName::hash> pendingSubscribeTracks_;
   folly::F14FastMap<TrackAlias, std::list<Payload>, TrackAlias::hash>

@@ -722,6 +722,127 @@ CO_TEST_P_X(MoQSessionTest, ObjectAckLatencyReported) {
   co_await publishDone_;
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
+// A subgroup stream that was written and FIN'd stays alive until the transport
+// acknowledges its last bytes, and it holds its track publisher. Neither is
+// tied to the session: the acknowledgement can arrive after the session is
+// destroyed, and must not reach into it then.
+//
+// UNSUBSCRIBE makes this reachable. It takes the publisher out of pubTracks_,
+// so the session's teardown never visits it, while a stream that FIN'd before
+// the UNSUBSCRIBE has nothing left to reset and keeps waiting.
+CO_TEST_P_X(MoQSessionTest, AckAfterUnsubscribeAndSessionDestroyed) {
+  co_await setupMoQSession();
+  const auto objStreamId = serverObjectStreamId();
+  std::shared_ptr<MockSubscriptionHandle> pubHandle;
+  folly::coro::Baton published;
+  expectSubscribe(
+      [this, objStreamId, &pubHandle, &published](
+          auto sub, auto pub) -> TaskSubscribeResult {
+        eventBase_.add([this, pub, objStreamId, &published] {
+          // The fake transport starts the subscriber's stream reader inline,
+          // in whatever request context is current. This one holds the
+          // publisher's session, and that reader waits for bytes the test
+          // holds back, so publish in a fresh context.
+          folly::RequestContextScopeGuard freshContext;
+          auto sgp = pub->beginSubgroup(0, 0, 0).value();
+          // Written and FIN'd, with the acknowledgement held back.
+          serverWt_->writeHandles[objStreamId]->setImmediateDelivery(false);
+          EXPECT_TRUE(sgp->object(0, moxygen::test::makeBuf(10)).hasValue());
+          EXPECT_TRUE(sgp->endOfSubgroup().hasValue());
+          published.post();
+        });
+        pubHandle = makeSubscribeOkResult(sub);
+        co_return pubHandle;
+      });
+
+  auto res = co_await clientSession_->subscribe(
+      getSubscribe(kTestTrackName), subscribeCallback_);
+  EXPECT_TRUE(res.hasValue());
+  co_await published;
+
+  // What the transport still holds for the stream: its unacknowledged bytes
+  // and the callbacks registered on them. Closing the session cancels neither,
+  // because a FIN'd stream is no longer open.
+  auto objStream = serverWt_->writeHandles[objStreamId];
+
+  folly::coro::Baton unsubscribed;
+  EXPECT_CALL(*pubHandle, unsubscribe()).WillOnce([&unsubscribed] {
+    unsubscribed.post();
+  });
+  res.value()->unsubscribe();
+  co_await unsubscribed;
+  // Let the server finish handling the UNSUBSCRIBE.
+  co_await rescheduleN(2);
+
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+  clientWt_->setPeerHandler(nullptr);
+  std::weak_ptr<MoQSession> serverSession = serverSession_;
+  serverSession_.reset();
+  co_await rescheduleN(10);
+  EXPECT_TRUE(serverSession.expired())
+      << "the server session is still alive, so nothing below is tested";
+  // Let go of its memory as well, which a weak reference would keep.
+  serverSession.reset();
+
+  // The acknowledgement arrives. A read of the destroyed session is a
+  // heap-use-after-free under ASan; without ASan it most often finds the
+  // session's old stats pointer and calls it.
+  EXPECT_CALL(*serverPublisherStatsCallback_, recordObjectAckLatency(_))
+      .Times(0);
+  objStream->deliverInflightData();
+}
+
+// The same, reached by PUBLISH_DONE, which also takes the publisher out of
+// pubTracks_ while a FIN'd stream waits for its acknowledgement.
+CO_TEST_P_X(MoQSessionTest, AckAfterPublishDoneAndSessionDestroyed) {
+  co_await setupMoQSession();
+  const auto objStreamId = serverObjectStreamId();
+  folly::coro::Baton published;
+  expectSubscribe(
+      [this, objStreamId, &published](
+          auto sub, auto pub) -> TaskSubscribeResult {
+        eventBase_.add([this, pub, sub, objStreamId, &published] {
+          // As above: keep the subscriber's stream reader out of the
+          // publisher's request context.
+          folly::RequestContextScopeGuard freshContext;
+          auto sgp = pub->beginSubgroup(0, 0, 0).value();
+          serverWt_->writeHandles[objStreamId]->setImmediateDelivery(false);
+          EXPECT_TRUE(sgp->object(0, moxygen::test::makeBuf(10)).hasValue());
+          EXPECT_TRUE(sgp->endOfSubgroup().hasValue());
+          EXPECT_TRUE(
+              pub->publishDone(getTrackEndedPublishDone(sub.requestID))
+                  .hasValue());
+          published.post();
+        });
+        co_return makeSubscribeOkResult(sub);
+      });
+  // The subscriber is told at PUBLISH_DONE or when its session closes.
+  EXPECT_CALL(*subscribeCallback_, publishDone(_))
+      .Times(testing::AtMost(1))
+      .WillRepeatedly(testing::Return(folly::unit));
+
+  auto res = co_await clientSession_->subscribe(
+      getSubscribe(kTestTrackName), subscribeCallback_);
+  EXPECT_TRUE(res.hasValue());
+  co_await published;
+  auto objStream = serverWt_->writeHandles[objStreamId];
+  co_await rescheduleN(2);
+
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+  clientWt_->setPeerHandler(nullptr);
+  std::weak_ptr<MoQSession> serverSession = serverSession_;
+  serverSession_.reset();
+  co_await rescheduleN(10);
+  EXPECT_TRUE(serverSession.expired())
+      << "the server session is still alive, so nothing below is tested";
+  // Let go of its memory as well, which a weak reference would keep.
+  serverSession.reset();
+
+  EXPECT_CALL(*serverPublisherStatsCallback_, recordObjectAckLatency(_))
+      .Times(0);
+  objStream->deliverInflightData();
+}
+
 CO_TEST_P_X(MoQSessionTest, DeliveryCallbackObjectSplitInTwo) {
   co_await setupMoQSession();
   auto deliveryCallback =
